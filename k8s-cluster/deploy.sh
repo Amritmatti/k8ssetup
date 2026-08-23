@@ -397,10 +397,36 @@ kubectl apply -f /tmp/flannel.yaml
 }
 
 # =================================================================== joins ==
+# Fail early, with the API server's own words, when the control plane is not
+# serving -- otherwise every later step dies with an unexplained exit 1.
+require_cluster() {
+  local out
+  if ! out="$(kctl "kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes" 2>&1)"; then
+    err "the control plane on $FIRST_MASTER_NAME ($FIRST_MASTER_IP) is not answering:"
+    printf '%s\n' "$out" | sed 's/^/      /' >&2
+    die "endpoint in use is https://${CP_ENDPOINT}. Check, on $FIRST_MASTER_NAME:
+        sudo systemctl status kubelet haproxy keepalived
+        sudo crictl ps | grep apiserver
+        ip -4 addr | grep ${VIP:-$FIRST_MASTER_IP}
+       If this cluster was built with a different controlPlaneEndpoint, rebuild it:
+        FORCE=yes ./deploy.sh reset && ./deploy.sh deploy"
+  fi
+}
+
 join_info() {   # refresh JOIN_CMD + CERT_KEY (both are short-lived)
-  JOIN_CMD="$(kctl "kubeadm token create --print-join-command 2>/dev/null" | tr -d '\r' | grep '^kubeadm join' | tail -1)"
-  [ -n "$JOIN_CMD" ] || die "could not generate a join command on $FIRST_MASTER_NAME"
-  CERT_KEY="$(kctl "kubeadm init phase upload-certs --upload-certs 2>/dev/null" | tr -d '\r' | grep -E '^[a-f0-9]{32,}$' | tail -1)"
+  local out
+  out="$(kctl "kubeadm token create --print-join-command" 2>&1)" || {
+    err "'kubeadm token create' failed on $FIRST_MASTER_NAME:"
+    printf '%s\n' "$out" | sed 's/^/      /' >&2
+    die "cannot mint a join token -- see the error above"
+  }
+  JOIN_CMD="$(printf '%s\n' "$out" | tr -d '\r' | grep '^kubeadm join' | tail -1)"
+  [ -n "$JOIN_CMD" ] || {
+    printf '%s\n' "$out" | sed 's/^/      /' >&2
+    die "no join command in the output of 'kubeadm token create' on $FIRST_MASTER_NAME"
+  }
+  out="$(kctl "kubeadm init phase upload-certs --upload-certs" 2>&1)" || true
+  CERT_KEY="$(printf '%s\n' "$out" | tr -d '\r' | grep -E '^[a-f0-9]{32,}$' | tail -1)"
 }
 
 node_joined() { kctl "kubectl get node $1 --no-headers 2>/dev/null || true" | grep -q "^$1[[:space:]]"; }
@@ -529,6 +555,7 @@ cmd_add() {
 
   if [ "$known" = yes ]; then step "re-adding $role $name ($ip)"
   else step "adding $role $name ($ip)"; fi
+  require_cluster   # no point preparing a node we cannot join it to
   gen_hosts_file
   for i in "${!NAMES[@]}"; do   # refresh /etc/hosts everywhere
     _scp "$STAGE_DIR/k8s-hosts" "${IPS[$i]}" /tmp/k8s-hosts >/dev/null 2>&1 || continue
