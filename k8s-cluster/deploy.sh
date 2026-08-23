@@ -4,7 +4,8 @@
 #
 #    ./deploy.sh preflight              check every VM before touching it
 #    ./deploy.sh deploy                 build the whole cluster   (default)
-#    ./deploy.sh add worker-4 IP [k=v]  add one more node later
+#    ./deploy.sh add worker-4 IP [k=v]  add a brand-new node
+#    ./deploy.sh add worker-2           re-add a node listed in cluster.conf
 #    ./deploy.sh status                 nodes / unhealthy pods / etcd / VIP
 #    ./deploy.sh kubeconfig             re-fetch the admin kubeconfig
 #    ./deploy.sh reset [label]          tear down every node, or just one
@@ -92,6 +93,7 @@ parse_nodes() {
 }
 
 ip_of() { local i; for i in "${!NAMES[@]}"; do [ "${NAMES[$i]}" = "$1" ] && { echo "${IPS[$i]}"; return 0; }; done; return 1; }
+idx_of() { local i; for i in "${!NAMES[@]}"; do [ "${NAMES[$i]}" = "$1" ] && { echo "$i"; return 0; }; done; return 1; }
 
 # ------------------------------------------------------------------- ssh ----
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
@@ -507,13 +509,26 @@ cmd_status() {
 
 # ==================================================================== add ===
 cmd_add() {
-  local name="${1:-}" ip="${2:-}" labels="${3:-}" role i
-  [ -n "$name" ] && [ -n "$ip" ] || die "usage: $0 add <label> <ip> [k=v,k=v]"
-  case "$name" in master-*|control-*|cp-*) role=master ;; *) role=worker ;; esac
-  NAMES+=("$name"); IPS+=("$ip"); ROLES+=("$role"); XLABELS+=("$labels")
-  if [ "$role" = master ]; then MASTER_NAMES+=("$name"); MASTER_IPS+=("$ip"); fi
+  local name="${1:-}" ip="${2:-}" labels="${3:-}" role i idx known=no
+  [ -n "$name" ] || die "usage: $0 add <label> [ip] [k=v,k=v]"
 
-  step "adding $role $name ($ip)"
+  if idx="$(idx_of "$name")"; then
+    # Already described in cluster.conf -- this is a re-add after 'reset <label>'.
+    # Reuse its IP and labels instead of appending a duplicate entry.
+    known=yes
+    [ -n "$ip" ] || ip="${IPS[$idx]}"
+    [ "$ip" = "${IPS[$idx]}" ] || die "$name is ${IPS[$idx]} in $CONFIG, not $ip -- edit the config instead"
+    [ -n "$labels" ] || labels="${XLABELS[$idx]}"
+    role="${ROLES[$idx]}"
+  else
+    [ -n "$ip" ] || die "$name is not in $CONFIG -- usage: $0 add <label> <ip> [k=v,k=v]"
+    case "$name" in master-*|control-*|cp-*) role=master ;; *) role=worker ;; esac
+    NAMES+=("$name"); IPS+=("$ip"); ROLES+=("$role"); XLABELS+=("$labels")
+    if [ "$role" = master ]; then MASTER_NAMES+=("$name"); MASTER_IPS+=("$ip"); fi
+  fi
+
+  if [ "$known" = yes ]; then step "re-adding $role $name ($ip)"
+  else step "adding $role $name ($ip)"; fi
   gen_hosts_file
   for i in "${!NAMES[@]}"; do   # refresh /etc/hosts everywhere
     _scp "$STAGE_DIR/k8s-hosts" "${IPS[$i]}" /tmp/k8s-hosts >/dev/null 2>&1 || continue
@@ -526,11 +541,10 @@ cmd_add() {
     join_master "$name" "$ip"
     log "re-rendering HAProxy so every master knows about the new backend"
     setup_lb
-    warn "add \"$name  $ip\" to NODES in $CONFIG so future runs keep it"
   else
     join_worker "$name" "$ip"
-    warn "add \"$name  $ip\" to NODES in $CONFIG so future runs keep it"
   fi
+  [ "$known" = yes ] || warn "add \"$name  $ip\" to NODES in $CONFIG so future runs keep it"
   apply_labels
   cmd_status
 }
@@ -612,7 +626,8 @@ cmd_deploy() {
 EOF
 }
 
-usage() { sed -n '2,14p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; }
+# print the header comment block, stopping at the first non-comment line
+usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
 
 # =================================================================== main ===
 parse_nodes

@@ -165,11 +165,48 @@ worker-1   Ready    worker          3m    v1.33.x   192.168.1.183
 | Command | Effect |
 |---|---|
 | `./deploy.sh status` | nodes, unhealthy pods, etcd members, which master holds the VIP |
-| `./deploy.sh add worker-4 192.168.1.186 zone=b` | prep + join one new node (then add it to `cluster.conf`) |
+| `./deploy.sh add worker-4 192.168.1.186 zone=b` | prep + join a brand-new node (then add it to `cluster.conf`) |
+| `./deploy.sh add worker-2` | re-add a node that is already in `cluster.conf` |
 | `./deploy.sh add master-4 192.168.1.187` | joins a control-plane node and re-renders HAProxy |
 | `./deploy.sh kubeconfig` | re-fetch the admin kubeconfig |
 | `./deploy.sh reset worker-2` | drain, delete, and `kubeadm reset` one node |
 | `FORCE=yes ./deploy.sh reset` | wipe Kubernetes from every VM (the VMs survive) |
+
+### Removing and re-adding a node
+
+```bash
+./deploy.sh reset worker-2      # drain -> delete from the cluster -> kubeadm reset the VM
+./deploy.sh add   worker-2      # prep -> join -> re-label
+```
+
+No IP needed on the way back: `worker-2` is still listed in `cluster.conf`, so `add`
+reuses that entry's IP and extra labels instead of creating a second one. Passing an IP
+that contradicts the config is refused — edit `cluster.conf` if the address really changed.
+
+What each half does:
+
+* **`reset worker-2`** — `kubectl drain` (evicting pods, ignoring daemonsets), `kubectl
+  delete node`, then `kubeadm reset -f` on the VM plus CNI interfaces, iptables rules and
+  `/etc/kubernetes`. The VM itself, containerd, and the kubeadm packages all survive.
+* **`add worker-2`** — re-runs `node-prep.sh` (fast the second time; packages are already
+  installed), mints a fresh join token, joins, re-applies `node-role.kubernetes.io/worker`
+  and any extra labels, then prints cluster status.
+
+`./deploy.sh deploy` does the same thing for *every* missing node, so it is the shortcut
+when you have reset several at once — already-joined nodes are skipped.
+
+Re-adding a **master** works the same way (`./deploy.sh add master-2`) and additionally
+re-renders HAProxy on all masters. Make sure the etcd member is really gone first —
+`reset master-2` removes it, but if you powered the VM off instead, remove the stale
+member before re-joining or etcd will reject it:
+
+```bash
+kubectl -n kube-system exec -it etcd-master-1 -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key member list      # find the id
+# then: ... member remove <id>
+```
 
 **HA test:** `vagrant halt master-1` (or power it off in the VirtualBox GUI), wait ~5 s,
 then `kubectl get nodes` again. Keepalived moves the VIP to `master-2` and the API keeps
