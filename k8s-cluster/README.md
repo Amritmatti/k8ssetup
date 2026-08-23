@@ -15,11 +15,55 @@ k8s-cluster/
     └── lb-setup.sh      runs on each master: HAProxy + Keepalived (the VIP)
 ```
 
+## Resource requirements
+
+### Per VM
+
+| | vCPU | RAM | Disk | Notes |
+|---|---|---|---|---|
+| **Master (hard floor)** | **2** | **2 GB** | 10 GB | kubeadm aborts below 2 CPU; below 2 GB the control plane OOMs during init |
+| Master (comfortable) | 2 | 2.5–3 GB | 15 GB | what the bundled `Vagrantfile` sets (2 vCPU / 2560 MB) |
+| **Worker (hard floor)** | **1** | **1 GB** | 10 GB | works, but leaves only ~300 MB for your pods |
+| Worker (comfortable) | 2 | 2 GB | 15 GB | room for real workloads |
+
+Idle consumption once the cluster settles: **~1.3–1.6 GB** on a master (etcd, apiserver,
+controller-manager, scheduler, calico-node, kube-proxy) and **~600–800 MB** on a worker.
+
+What `./deploy.sh preflight` checks: masters with `< 2 vCPU` are a **hard failure**;
+`< 1700 MB` RAM or `< 8 GB` free disk on any node is a **warning** and the deploy continues.
+
+### Host totals
+
+| Layout | VMs | RAM for VMs | Host RAM incl. OS | Disk |
+|---|---|---|---|---|
+| 3 masters + 3 workers (the shipped `cluster.conf`) | 6 | ~15 GB | **20 GB** (16 GB is tight) | 60–90 GB |
+| **3 masters + 2 workers** — smallest real HA cluster | 5 | ~10 GB | **16 GB** | ~50 GB |
+| 3 masters + 1 worker | 4 | ~8 GB | **12 GB** | ~40 GB |
+| 1 master + 2 workers (`VIP=""`) — no HA | 3 | ~5 GB | **8 GB** | ~30 GB |
+
+CPU can be oversubscribed: 6 VMs × 2 vCPU on a 4-core/8-thread host is fine, just slower
+during the parallel `apt` phase. Never give a single VM more vCPUs than the host has
+physical cores.
+
+Disks are thin-provisioned (dynamic VDI) — the Ubuntu box is ~2.5 GB and a node grows to
+~6–8 GB once container images are pulled, so a 20 GB virtual disk costs ~8 GB of real space.
+
+### If you are short on RAM
+
+* Drop to **3 masters + 2 workers**, and untaint the masters so they run pods too:
+  `kubectl taint nodes --all node-role.kubernetes.io/control-plane-`
+* Set `CNI="flannel"` — saves ~150 MB per node versus Calico (Felix is the heavy part).
+* Workers at 1 vCPU / 1536 MB and masters at 2048 MB is a workable floor.
+
+Keep **3** masters, not 2. etcd quorum is `(n/2)+1`, so a two-member cluster stops serving
+when either master dies — strictly worse than a single master. That is why `deploy.sh`
+refuses a multi-master config that has no `VIP`.
+
 ## 1. Prepare the VMs
 
 Six VMs (3 masters, 3 workers) of Ubuntu 22.04/24.04 or Debian 12, each with:
 
-* **2 vCPU / 2 GB RAM minimum** for masters (kubeadm refuses less than 2 CPUs)
+* Enough CPU/RAM/disk — see [Resource requirements](#resource-requirements) above
 * **Two network adapters**: NAT (internet) + **Host-only or Bridged** (cluster traffic).
   The host-only address is what goes into `cluster.conf` — never `10.0.2.15`, which
   every NAT adapter shares.
