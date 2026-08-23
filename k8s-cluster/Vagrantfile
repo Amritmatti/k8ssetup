@@ -7,11 +7,24 @@
 #      ./deploy.sh deploy    # build the cluster on them
 #
 #  Vagrant's default user is 'vagrant' with passwordless sudo, which is what
-#  cluster.conf assumes. Vagrant boxes get NAT on eth0 and the private_network
-#  address on eth1 -- that eth1 address is the one you put in cluster.conf.
+#  cluster.conf assumes. Every VM gets NAT on eth0 and a bridged LAN address on
+#  eth1 -- that eth1 address is the one you put in cluster.conf.
+#
+#  These VMs sit on your real 192.168.1.0/24 LAN (bridged), so .180-.185 and the
+#  VIP .179 must all be OUTSIDE your router's DHCP pool, or a lease will collide
+#  with a node and break the cluster.
+#
+#  Host-only instead of bridged? VirtualBox only permits 192.168.56.0/21 for
+#  host-only networks unless you allow the range yourself:
+#      echo "* 192.168.1.0/24" | sudo tee -a /etc/vbox/networks.conf
+#  then swap public_network for: private_network, ip: ip, netmask: NETMASK
 # -----------------------------------------------------------------------------
 BOX      = "bento/ubuntu-24.04"
 NETMASK  = "255.255.255.0"
+
+# Host NIC to bridge onto. Leave nil and Vagrant asks which one to use;
+# set it to skip the prompt, e.g. "eth0", "wlp3s0", "Intel(R) Ethernet I219-V".
+BRIDGE   = nil
 
 NODES = [
   # name,       ip,               cpus, memory(MB)
@@ -32,13 +45,17 @@ Vagrant.configure("2") do |config|
   NODES.each do |name, ip, cpus, mem|
     config.vm.define name do |node|
       node.vm.hostname = name
-      node.vm.network "private_network", ip: ip, netmask: NETMASK
+      if BRIDGE
+        node.vm.network "public_network", ip: ip, netmask: NETMASK, bridge: BRIDGE
+      else
+        node.vm.network "public_network", ip: ip, netmask: NETMASK
+      end
       node.vm.provider "virtualbox" do |vb|
         vb.name   = "k8s-#{name}"
         vb.cpus   = cpus
         vb.memory = mem
-        # Keepalived's VRRP multicast + the floating VIP need promiscuous mode
-        # on the host-only adapter.
+        # Keepalived's VRRP + the floating VIP need promiscuous mode on the
+        # cluster adapter, or VirtualBox drops the VIP's ARP replies.
         vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
         vb.customize ["modifyvm", :id, "--groups", "/k8s-lab"]
       end

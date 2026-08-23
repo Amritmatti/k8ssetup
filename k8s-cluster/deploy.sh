@@ -72,6 +72,17 @@ parse_nodes() {
   if [ -n "$VIP" ]; then
     CP_ENDPOINT="${VIP}:${VIP_PORT}"; USE_LB=yes
     if printf '%s\n' "${IPS[@]}" | grep -qx "$VIP"; then die "VIP $VIP must not be one of the node IPs"; fi
+    # The VIP is an extra address on the nodes' own NIC -- it MUST share their subnet,
+    # otherwise only the master holding it can reach it and every join times out.
+    local vip_net node_net
+    vip_net="${VIP%.*}"; node_net="${FIRST_MASTER_IP%.*}"
+    if [ "$vip_net" != "$node_net" ]; then
+      die "VIP $VIP is not on the node subnet (${node_net}.0/24, e.g. $FIRST_MASTER_IP).
+       Pick a free address such as ${node_net}.179 -- outside your DHCP pool."
+    fi
+    for ip in "${IPS[@]}"; do
+      [ "${ip%.*}" = "$node_net" ] || warn "$ip is not on ${node_net}.0/24 -- the VIP can only serve one subnet"
+    done
   else
     CP_ENDPOINT="${FIRST_MASTER_IP}:6443"; USE_LB=no
     [ "${#MASTER_IPS[@]}" -le 1 ] || die "a multi-master cluster needs VIP set in $CONFIG"
@@ -231,14 +242,48 @@ setup_lb() {
       || die "load balancer setup failed on ${MASTER_NAMES[$i]}"
     prio=$((prio - 10))
   done
-  log "waiting for the VIP to come up"
+  # Probe from a node that does NOT hold the VIP -- pinging it from the holder
+  # always succeeds and would hide a wrong-subnet or promiscuous-mode problem.
+  local prober prober_name
+  if   [ "${#WORKER_IPS[@]}" -gt 0 ]; then prober="${WORKER_IPS[0]}";  prober_name="${WORKER_NAMES[0]}"
+  elif [ "${#MASTER_IPS[@]}" -gt 1 ]; then prober="${MASTER_IPS[1]}";  prober_name="${MASTER_NAMES[1]}"
+  else prober="$FIRST_MASTER_IP"; prober_name="$FIRST_MASTER_NAME"; fi
+
+  log "waiting for the VIP to answer from $prober_name"
   for n in $(seq 1 30); do
-    if rroot "$FIRST_MASTER_IP" "ping -c1 -W1 $VIP >/dev/null 2>&1 && echo UP || echo DOWN" | grep -q UP; then
-      ok "VIP $VIP is live"; return 0
+    if rroot "$prober" "ping -c1 -W1 $VIP >/dev/null 2>&1 && echo UP || echo DOWN" | grep -q UP; then
+      ok "VIP $VIP is live and reachable from $prober_name"; return 0
     fi
     sleep 2
   done
-  die "VIP $VIP never came up -- check 'systemctl status keepalived' on the masters"
+  die "VIP $VIP is not reachable from $prober_name. Check, in this order:
+       1. $VIP is on the same subnet as the nodes (${FIRST_MASTER_IP%.*}.0/24)
+       2. 'systemctl status keepalived' on the masters, and 'ip -4 addr' to see who holds it
+       3. promiscuous mode = 'Allow All' on the masters' cluster NIC in VirtualBox"
+}
+
+# Refuse to start joining until the advertised endpoint actually works from
+# another VM -- this is what turns a silent 'kubeadm join' timeout into a
+# one-line explanation.
+verify_endpoint() {
+  [ "$USE_LB" = yes ] || return 0
+  step "verifying the control-plane endpoint ${CP_ENDPOINT}"
+  local prober prober_name n
+  if   [ "${#WORKER_IPS[@]}" -gt 0 ]; then prober="${WORKER_IPS[0]}";  prober_name="${WORKER_NAMES[0]}"
+  elif [ "${#MASTER_IPS[@]}" -gt 1 ]; then prober="${MASTER_IPS[1]}";  prober_name="${MASTER_NAMES[1]}"
+  else return 0; fi
+  for n in $(seq 1 20); do
+    if rroot "$prober" "curl -sk --max-time 5 https://${CP_ENDPOINT}/healthz 2>/dev/null | grep -q ok && echo REACHABLE || echo NO" | grep -q REACHABLE; then
+      ok "https://${CP_ENDPOINT}/healthz answers from $prober_name"
+      return 0
+    fi
+    sleep 3
+  done
+  die "the API is up on $FIRST_MASTER_NAME but https://${CP_ENDPOINT} is unreachable from $prober_name.
+       Every join and every kubelet uses that address, so fix it before continuing:
+         - is $VIP on ${FIRST_MASTER_IP%.*}.0/24, the same subnet as the nodes?
+         - 'systemctl status haproxy' on the VIP holder, and 'ss -lntp | grep $VIP_PORT'
+         - 'journalctl -u keepalived -n 30' on all masters"
 }
 
 # ============================================================ first master ==
@@ -540,6 +585,7 @@ cmd_deploy() {
   prep_all
   setup_lb
   init_first_master
+  verify_endpoint
   install_cni
   join_all
   apply_labels
