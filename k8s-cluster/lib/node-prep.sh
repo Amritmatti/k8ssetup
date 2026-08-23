@@ -11,6 +11,9 @@ HOSTS_FILE="${4:-/tmp/k8s-hosts}"
 export DEBIAN_FRONTEND=noninteractive
 say() { echo "  [$NODE_NAME] $*"; }
 
+# Never fail silently: report the exact line and command that died.
+trap 'rc=$?; echo "  [$NODE_NAME] ERROR at line $LINENO (exit $rc): $BASH_COMMAND" >&2; exit $rc' ERR
+
 # --- sanity ---------------------------------------------------------------
 command -v apt-get >/dev/null || { echo "ERROR: only Debian/Ubuntu supported"; exit 1; }
 ip -4 -o addr show | grep -qw "$NODE_IP" || {
@@ -25,12 +28,15 @@ cat "$HOSTS_FILE" >> /etc/hosts
 
 # --- swap off -------------------------------------------------------------
 say "disabling swap"
-swapoff -a || true
-sed -i.bak -E 's|^([^#].*\sswap\s)|#\1|' /etc/fstab
-systemctl list-unit-files --type=swap --no-legend 2>/dev/null | awk '{print $1}' | while read -r u; do
-  [ -n "$u" ] && systemctl --now mask "$u" >/dev/null 2>&1 || true
-done
+swapoff -a >/dev/null 2>&1 || true
+if [ -f /etc/fstab ]; then sed -i.bak -E 's|^([^#].*[[:space:]]swap[[:space:]])|#\1|' /etc/fstab; fi
+# systemctl exits non-zero when nothing matches, so absorb it before pipefail sees it
+SWAP_UNITS="$(systemctl list-unit-files --type=swap --no-legend 2>/dev/null | awk '{print $1}' || true)"
+for u in $SWAP_UNITS; do systemctl --now mask "$u" >/dev/null 2>&1 || true; done
 systemctl --now disable systemd-zram-setup@zram0.service >/dev/null 2>&1 || true
+if [ "$(awk '/^SwapTotal/{print $2}' /proc/meminfo)" != "0" ]; then
+  say "WARN: swap is still active -- 'swapon --show' on this VM"
+fi
 
 # --- firewall (lab clusters: get it out of the way) -----------------------
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then

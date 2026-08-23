@@ -125,7 +125,10 @@ rroot() {
   local ip="$1"; shift
   local tmp rc=0
   tmp="$(mktemp "${TMPDIR:-/tmp}/k8sd-inline.XXXXXX")"
-  { echo '#!/usr/bin/env bash'; echo 'set -euo pipefail'; printf '%s\n' "$*"; } > "$tmp"
+  { echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'trap '"'"'rc=$?; echo "remote ERROR at line $LINENO (exit $rc): $BASH_COMMAND" >&2; exit $rc'"'"' ERR'
+    printf '%s\n' "$*"; } > "$tmp"
   run_script "$ip" "$tmp" || rc=$?
   rm -f "$tmp"
   return $rc

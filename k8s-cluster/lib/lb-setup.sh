@@ -7,6 +7,7 @@ set -euo pipefail
 NODE_IP="$1"; VIP="$2"; VIP_PORT="$3"; PRIORITY="$4"; ROUTER_ID="$5"; AUTH_PASS="$6"; BACKENDS="$7"
 export DEBIAN_FRONTEND=noninteractive
 say() { echo "  [lb $NODE_IP] $*"; }
+trap 'rc=$?; echo "  [lb $NODE_IP] ERROR at line $LINENO (exit $rc): $BASH_COMMAND" >&2; exit $rc' ERR
 
 IFACE="$(ip -4 -o addr show | awk -v ip="$NODE_IP" '$4 ~ "^"ip"/" {print $2; exit}')"
 [ -n "$IFACE" ] || { echo "ERROR: no interface holds $NODE_IP"; exit 1; }
