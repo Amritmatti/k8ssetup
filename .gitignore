@@ -6,3 +6,8 @@ terraform.tfvars
 *.auto.tfvars
 crash.log
 *.pem
+
+# k8s-cluster generated artifacts
+k8s-cluster/logs/
+k8s-cluster/.stage/
+k8s-cluster/kubeconfig
