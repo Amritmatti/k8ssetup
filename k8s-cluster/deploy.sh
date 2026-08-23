@@ -572,7 +572,13 @@ exit 0
 " >/dev/null 2>&1 || warn "reset reported errors on ${targets_n[$i]}"
     ok "${targets_n[$i]} reset"
   done
-  if [ -z "$only" ]; then rm -f "$KUBECONFIG_OUT" 2>/dev/null || true; fi
+  if [ -z "$only" ]; then
+    # Drop generated artifacts too -- a stale kubeadm-init.yaml from a bad run is
+    # confusing to find later, even though every deploy regenerates it.
+    rm -f "$KUBECONFIG_OUT" 2>/dev/null || true
+    rm -rf "$STAGE_DIR" 2>/dev/null || true
+    ok "removed $KUBECONFIG_OUT and .stage/"
+  fi
 }
 
 # ================================================================= deploy ===
