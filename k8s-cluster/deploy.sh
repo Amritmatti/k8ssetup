@@ -6,7 +6,8 @@
 #    ./deploy.sh deploy                 build the whole cluster   (default)
 #    ./deploy.sh add worker-4 IP [k=v]  add a brand-new node
 #    ./deploy.sh add worker-2           re-add a node listed in cluster.conf
-#    ./deploy.sh upgrade 1.34           upgrade the cluster ONE minor version
+#    ./deploy.sh upgrade 1.34           upgrade every node, one at a time
+#    ./deploy.sh upgrade 1.34 master-1  upgrade a SINGLE node, then stop
 #    ./deploy.sh status                 nodes / unhealthy pods / etcd / VIP
 #    ./deploy.sh kubeconfig             re-fetch the admin kubeconfig
 #    ./deploy.sh reset [label]          tear down every node, or just one
@@ -696,112 +697,183 @@ EOF
   fi
 }
 
+# --- version bookkeeping, so a per-node run knows where the cluster stands ---
+UPG_VERS=""
+upg_load_versions() {
+  UPG_VERS="$(kctl "kubectl get nodes --no-headers -o custom-columns=N:.metadata.name,V:.status.nodeInfo.kubeletVersion" | tr -d '\r')"
+  [ -n "$UPG_VERS" ] || die "could not read node versions from $FIRST_MASTER_NAME"
+}
+upg_ver()   { awk -v n="$1" '$1==n{print $2}' <<<"$UPG_VERS"; }        # -> v1.33.13
+upg_minor() { local v="${1#v}"; v="${v#*.}"; echo "${v%%.*}"; }        # v1.33.13 -> 33
+
+# The full per-node sequence. Safe to call for a node already on the target.
+upgrade_one_node() {   # <index> <target-minor> <phase: apply|node>
+  local i="$1" target="$2" phase="$3"
+  local name="${NAMES[$i]}" ip="${IPS[$i]}"
+
+  if ! node_joined "$name"; then warn "$name is not a cluster member -- skipping"; return 0; fi
+  if [ "$(upg_minor "$(upg_ver "$name")")" -ge "${target#1.}" ]; then
+    ok "$name is already on $(upg_ver "$name") -- nothing to do"; return 0
+  fi
+
+  step "$name (${ROLES[$i]}) $(upg_ver "$name") -> ${target}"
+
+  # 1. control-plane components; the node keeps serving traffic during this
+  run_script "$ip" "$SCRIPT_DIR/lib/upgrade-node.sh" "$target" "$phase" \
+    || die "kubeadm upgrade failed on $name -- every other node is untouched"
+  if [ "$phase" = apply ]; then
+    wait_settled "the control-plane upgrade on $name" 600 \
+      || die "control plane unhealthy after 'kubeadm upgrade apply' -- stopping before anything is drained"
+  fi
+
+  # 2. stop scheduling, then evict politely (PDBs decide the pace)
+  log "cordoning $name"
+  kctl "kubectl cordon $name" >/dev/null
+  log "draining $name (PDB-aware, timeout ${DRAIN_TIMEOUT}s)"
+  if ! kctl "kubectl drain $name --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT}s" >/dev/null 2>&1; then
+    kctl "kubectl uncordon $name" >/dev/null || true
+    die "drain of $name did not complete -- a PodDisruptionBudget is holding pods, or a pod has no controller.
+       $name is uncordoned again and still running the old kubelet.
+       Look at:  kubectl get pods -A --field-selector spec.nodeName=$name
+       Then re-run the same command."
+  fi
+  ok "$name drained, workloads rescheduled elsewhere"
+
+  # 3. kubelet, while the node carries nothing
+  run_script "$ip" "$SCRIPT_DIR/lib/upgrade-node.sh" "$target" kubelet \
+    || die "kubelet upgrade failed on $name (node is cordoned and empty)"
+
+  # 4. back into service, then prove the whole cluster is healthy again
+  kctl "kubectl uncordon $name" >/dev/null
+  kctl "kubectl wait --for=condition=Ready node/$name --timeout=300s" >/dev/null \
+    || die "$name did not return Ready -- fix it before touching another node"
+  wait_settled "$name rejoining" 600 \
+    || die "cluster not healthy after $name -- stopping here"
+  upg_load_versions
+  ok "$name is on $(upg_ver "$name")"
+}
+
 cmd_upgrade() {
-  local target="${1:-}" cur cur_n tgt_n i name ip phase answer stamp
-  [ -n "$target" ] || die "usage: $0 upgrade <minor>   e.g. $0 upgrade 1.34"
+  local target="${1:-}" only="${2:-}" answer stamp i j idx phase
+  [ -n "$target" ] || die "usage: $0 upgrade <minor> [node]   e.g. $0 upgrade 1.34 master-1"
   [[ "$target" =~ ^1\.[0-9]+$ ]] || die "give a minor version like 1.34, not '$target'"
   require_cluster
+  upg_load_versions
 
-  cur="$(rroot "$FIRST_MASTER_IP" 'kubeadm version -o short' | tr -d '\rv' | tail -1)"
-  cur_n="${cur#1.}"; cur_n="${cur_n%%.*}"
-  tgt_n="${target#1.}"
-  [ "$tgt_n" -gt "$cur_n" ] || die "cluster is already on v${cur} -- kubeadm cannot downgrade"
-  if [ "$tgt_n" -ne "$((cur_n + 1))" ]; then
-    local chain="" n
-    for ((n = cur_n + 1; n <= tgt_n; n++)); do chain+="         ./deploy.sh upgrade 1.${n}"$'\n'; done
-    die "kubeadm cannot skip minor versions: v${cur} -> ${target}.x is $((tgt_n - cur_n)) hops.
-       Run them in order, verifying the cluster and your app between each:
+  local tgt_n="${target#1.}" min_n=9999 max_n=0 m n v
+  while read -r n v; do
+    [ -z "$n" ] && continue
+    m="$(upg_minor "$v")"
+    [ "$m" -lt "$min_n" ] && min_n="$m"
+    [ "$m" -gt "$max_n" ] && max_n="$m"
+  done <<<"$UPG_VERS"
+
+  [ "$tgt_n" -ge "$min_n" ] || die "the cluster is already on 1.${min_n}.x -- kubeadm cannot downgrade"
+  if [ "$tgt_n" -gt "$((min_n + 1))" ]; then
+    local chain="" k
+    for ((k = min_n + 1; k <= tgt_n; k++)); do chain+="         ./deploy.sh upgrade 1.${k}"$'\n'; done
+    die "kubeadm cannot skip minor versions: 1.${min_n}.x -> ${target}.x is $((tgt_n - min_n)) hops.
+       Run them in order, verifying your app between each:
 ${chain}"
   fi
 
-  step "pre-upgrade checks (v${cur} -> ${target}.x)"
+  # Canonical order: first master (the only one that runs 'upgrade apply'),
+  # then the other masters, then the workers. Never workers before masters --
+  # a kubelet must not be newer than the API server it talks to.
+  local order=()
+  idx="$(idx_of "$FIRST_MASTER_NAME")"; order+=("$idx")
+  for i in "${!NAMES[@]}"; do
+    if [ "${ROLES[$i]}" = master ] && [ "${NAMES[$i]}" != "$FIRST_MASTER_NAME" ]; then order+=("$i"); fi
+  done
+  for i in "${!NAMES[@]}"; do
+    if [ "${ROLES[$i]}" = worker ]; then order+=("$i"); fi
+  done
+
+  if [ -n "$only" ]; then
+    idx="$(idx_of "$only")" || die "unknown node label: $only"
+    if [ "$only" != "$FIRST_MASTER_NAME" ] && [ "$(upg_minor "$(upg_ver "$FIRST_MASTER_NAME")")" -lt "$tgt_n" ]; then
+      die "$FIRST_MASTER_NAME must go first -- it is the node that runs 'kubeadm upgrade apply'.
+       Start with:  ./deploy.sh upgrade $target $FIRST_MASTER_NAME"
+    fi
+    if [ "${ROLES[$idx]}" = worker ]; then
+      for j in "${!MASTER_NAMES[@]}"; do
+        if [ "$(upg_minor "$(upg_ver "${MASTER_NAMES[$j]}")")" -lt "$tgt_n" ]; then
+          die "every control-plane node must reach ${target} before any worker:
+       ${MASTER_NAMES[$j]} is still on $(upg_ver "${MASTER_NAMES[$j]}").
+       A kubelet newer than the API server is outside the supported version skew."
+        fi
+      done
+    fi
+    order=("$idx")
+  fi
+
+  step "pre-upgrade checks (cluster is on 1.${min_n}.x, target ${target}.x)"
   if [ "${#MASTER_NAMES[@]}" -lt 3 ]; then
-    warn "${#MASTER_NAMES[@]} master(s): the API server WILL be unavailable while it upgrades. 3 masters is the zero-downtime minimum."
+    warn "${#MASTER_NAMES[@]} master(s): the API server WILL be unavailable while it upgrades. 3 is the zero-downtime minimum."
   fi
   if [ "${#WORKER_NAMES[@]}" -lt 2 ]; then
     warn "${#WORKER_NAMES[@]} worker(s): pods evicted from the only worker have nowhere to go."
   fi
-  wait_settled "the pre-upgrade check" 300 || die "the cluster is not healthy right now -- fix it before upgrading"
+  wait_settled "the pre-upgrade check" 300 || die "the cluster is not healthy right now -- fix that before upgrading"
   upgrade_risk_report
 
   stamp="$(date +%Y%m%d-%H%M%S)"
   if [ "$SKIP_BACKUP" != yes ]; then etcd_backup "$stamp"; else warn "SKIP_BACKUP=yes -- no etcd snapshot taken"; fi
 
-  step "upgrade plan"
-  cat <<EOF
-  ${#MASTER_NAMES[@]} masters then ${#WORKER_NAMES[@]} workers, strictly one node at a time:
-      kubeadm -> upgrade -> cordon -> drain (respecting PDBs) -> kubelet -> uncordon
-      -> wait for the whole cluster to be healthy -> soak ${SOAK}s -> next node
-  drain timeout ${DRAIN_TIMEOUT}s; a drain that a PDB blocks ABORTS the run rather
-  than forcing eviction, so capacity is never removed from under your app.
-EOF
+  step "plan"
+  if [ -n "$only" ]; then
+    echo "  ONE node this run: ${NAMES[${order[0]}]} ($(upg_ver "${NAMES[${order[0]}]}") -> ${target})"
+    echo "  Nothing else is touched. Run the next node when you are satisfied."
+  else
+    printf '  %s node(s), strictly one at a time:\n   ' "${#order[@]}"
+    for i in "${order[@]}"; do printf ' %s' "${NAMES[$i]}"; done; echo
+    echo "  Soak ${SOAK}s between nodes. Use '$0 upgrade $target <node>' to go node by node instead."
+  fi
+  echo "  Per node: kubeadm -> upgrade -> cordon -> PDB-aware drain -> kubelet -> uncordon -> health gate"
+  echo "  drain timeout ${DRAIN_TIMEOUT}s; a PDB-blocked drain stops the run instead of forcing eviction."
   if [ "${FORCE:-no}" != yes ]; then
     [ -t 0 ] || die "not a terminal: re-run with FORCE=yes to confirm"
     read -r -p "  Type 'yes' to begin: " answer
     [ "$answer" = yes ] || { log "aborted"; return 0; }
   fi
 
-  for i in "${!NAMES[@]}"; do
-    name="${NAMES[$i]}"; ip="${IPS[$i]}"
-    node_joined "$name" || { warn "$name is not a cluster member -- skipping"; continue; }
-    if [ "${ROLES[$i]}" = master ] && [ "$name" = "$FIRST_MASTER_NAME" ]; then phase=apply; else phase=node; fi
-
-    step "$name (${ROLES[$i]}) -> ${target}"
-
-    # 1. control-plane components first; the node keeps serving while this runs
-    run_script "$ip" "$SCRIPT_DIR/lib/upgrade-node.sh" "$target" "$phase" \
-      || die "kubeadm upgrade failed on $name -- cluster left on v${cur}, other nodes untouched"
-    if [ "$phase" = apply ]; then
-      wait_settled "the control-plane upgrade on $name" 600 \
-        || die "control plane unhealthy after 'kubeadm upgrade apply' -- stopping before any node is drained"
-    fi
-
-    # 2. stop scheduling, then evict politely
-    log "cordoning $name"
-    kctl "kubectl cordon $name" >/dev/null
-    log "draining $name (PDB-aware, timeout ${DRAIN_TIMEOUT}s)"
-    if ! kctl "kubectl drain $name --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT}s" >/dev/null 2>&1; then
-      kctl "kubectl uncordon $name" >/dev/null || true
-      die "drain of $name did not complete -- a PodDisruptionBudget is holding pods, or a pod has no controller.
-       $name has been uncordoned and NOTHING was upgraded on it beyond kubeadm.
-       Inspect with:  kubectl get pods -A --field-selector spec.nodeName=$name
-       Then re-run the same command; already-upgraded nodes are no-ops."
-    fi
-    ok "$name drained, workloads rescheduled elsewhere"
-
-    # 3. kubelet, while the node carries no traffic
-    run_script "$ip" "$SCRIPT_DIR/lib/upgrade-node.sh" "$target" kubelet \
-      || die "kubelet upgrade failed on $name (node is still cordoned and empty)"
-
-    # 4. back into service, then prove the cluster is whole again
-    kctl "kubectl uncordon $name" >/dev/null
-    kctl "kubectl wait --for=condition=Ready node/$name --timeout=300s" >/dev/null \
-      || die "$name did not return Ready -- fix it before the next node"
-    wait_settled "$name rejoining" 600 \
-      || die "cluster not healthy after $name -- stopping here, remaining nodes untouched"
-    ok "$name is on ${target}"
-
-    # 5. soak: give autoscalers, caches and connection pools time to rebalance
-    if [ "$i" -lt "$(( ${#NAMES[@]} - 1 ))" ] && [ "${SOAK:-0}" -gt 0 ]; then
+  for j in "${!order[@]}"; do
+    i="${order[$j]}"
+    if [ "${NAMES[$i]}" = "$FIRST_MASTER_NAME" ]; then phase=apply; else phase=node; fi
+    upgrade_one_node "$i" "$target" "$phase"
+    if [ "$j" -lt "$(( ${#order[@]} - 1 ))" ] && [ "${SOAK:-0}" -gt 0 ]; then
       log "soaking ${SOAK}s before the next node (watch your dashboards)"
       sleep "$SOAK"
     fi
   done
 
-  if grep -q "^K8S_VERSION=" "$CONFIG"; then
-    sed -i.bak -E "s|^K8S_VERSION=.*|K8S_VERSION=\"${target}\"|" "$CONFIG"
-    ok "K8S_VERSION in $CONFIG set to ${target}"
+  # Only claim the cluster is on the new version when every node really is.
+  upg_load_versions
+  local behind=""
+  while read -r n v; do
+    [ -z "$n" ] && continue
+    [ "$(upg_minor "$v")" -lt "$tgt_n" ] && behind+="$n($v) "
+  done <<<"$UPG_VERS"
+
+  if [ -z "$behind" ]; then
+    if grep -q "^K8S_VERSION=" "$CONFIG"; then
+      sed -i.bak -E "s|^K8S_VERSION=.*|K8S_VERSION=\"${target}\"|" "$CONFIG"
+      ok "every node is on ${target}; K8S_VERSION in $CONFIG updated"
+    fi
+    step "upgrade to ${target} complete"
+  else
+    step "node(s) upgraded -- still on the old version: $behind"
+    echo "  Continue with:  $0 upgrade $target <node>"
+    echo "  K8S_VERSION in $CONFIG stays at its current value until every node is done."
   fi
-  step "upgrade to ${target} complete"
   cmd_status
   cat <<EOF
 
-  Post-upgrade checklist:
-    kubectl get nodes                       all on ${target}.x
-    kubectl get pods -A                     nothing restarting
-    kubectl -n kube-system get deploy coredns
+  Verify before the next node:
+    kubectl get nodes -o wide               versions and Ready
+    kubectl get pods -A -o wide             nothing pending or restarting
     your own smoke tests / SLO dashboards
-  etcd snapshot from before this run: $SCRIPT_DIR/backups/etcd-${stamp}.db
+  etcd snapshot taken before this run: $SCRIPT_DIR/backups/etcd-${stamp}.db
 EOF
 }
 
@@ -893,7 +965,7 @@ case "${1:-deploy}" in
   prep)       prep_all ;;
   lb)         setup_lb ;;
   add)        shift; cmd_add "$@" ;;
-  upgrade)    shift; cmd_upgrade "${1:-}" ;;
+  upgrade)    shift; cmd_upgrade "${1:-}" "${2:-}" ;;
   status)     cmd_status ;;
   kubeconfig) cmd_kubeconfig ;;
   reset)      shift; cmd_reset "${1:-}" ;;

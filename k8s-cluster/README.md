@@ -273,6 +273,40 @@ fully on the old version or partially upgraded but healthy — both are safe sta
 in while you investigate. Re-running the same command resumes: nodes already on the target
 pass through as no-ops.
 
+### One node at a time (recommended for production)
+
+Pass a node label and the run does exactly that node, then stops:
+
+```bash
+./deploy.sh upgrade 1.34 master-1     # first master -- runs 'kubeadm upgrade apply'
+# check dashboards, run smoke tests, take as long as you like
+./deploy.sh upgrade 1.34 master-2
+./deploy.sh upgrade 1.34 master-3
+./deploy.sh upgrade 1.34 worker-1
+./deploy.sh upgrade 1.34 worker-2
+./deploy.sh upgrade 1.34 worker-3
+```
+
+Every invocation re-runs the full pre-flight: health gate, disruption-risk report and a
+fresh etcd snapshot. Between runs the cluster is in a supported mixed-version state, so
+you can stop overnight and resume the next morning.
+
+**The order is enforced, not merely suggested:**
+
+* `master-1` (whichever is first in `cluster.conf`) must go first — it is the only node
+  that runs `kubeadm upgrade apply`, which upgrades the control plane, etcd and CoreDNS.
+  Asking for any other node first is refused with the command to run instead.
+* All masters must reach the target before any worker. A kubelet newer than the API
+  server it talks to is outside the supported version skew, so this is refused too.
+* A node already on the target version reports `already on v1.34.x -- nothing to do`,
+  so re-running is harmless.
+
+`K8S_VERSION` in `cluster.conf` is only rewritten once *every* node is on the new minor;
+until then the run tells you which nodes are still behind and what to run next.
+
+Doing the whole cluster in one go is still `./deploy.sh upgrade 1.34` — same per-node
+sequence, with `SOAK` seconds between nodes instead of waiting for you.
+
 ### Knobs
 
 ```bash
