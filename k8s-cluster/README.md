@@ -171,6 +171,8 @@ worker-1   Ready    worker          3m    v1.33.x   192.168.1.183
 | `./deploy.sh add worker-2` | re-add a node that is already in `cluster.conf` |
 | `./deploy.sh add master-4 192.168.1.187` | joins a control-plane node and re-renders HAProxy |
 | `SOAK=300 ./deploy.sh upgrade 1.34` | zero-downtime upgrade, one minor version |
+| `./deploy.sh upgrade 1.34 master-1` | upgrade a single node, then stop |
+| `./deploy.sh rollback 1.33 worker-1` | roll a worker back to the previous minor |
 | `./deploy.sh kubeconfig` | re-fetch the admin kubeconfig |
 | `./deploy.sh reset worker-2` | drain, delete, and `kubeadm reset` one node |
 | `FORCE=yes ./deploy.sh reset` | wipe Kubernetes from every VM (the VMs survive) |
@@ -390,6 +392,93 @@ sudo kubeadm upgrade node
 ```
 
 Masters first, workers last, one at a time.
+
+### Rolling back
+
+The honest summary: **workers roll back cleanly, control-plane nodes do not.**
+
+`kubeadm upgrade apply` is a one-way door. It rewrites the static pod manifests, the
+`kubeadm-config` ConfigMap and the schema of what is stored in etcd. Installing older
+packages over that gives you a broken master, not an old one — so `deploy.sh rollback`
+refuses masters and tells you what to do instead.
+
+| Situation | What to do |
+|---|---|
+| A worker misbehaves on the new version | `./deploy.sh rollback 1.33 worker-1` |
+| `kubeadm upgrade apply` failed part-way | Nothing — kubeadm restores the old manifests itself. Check `kubectl get nodes`, fix the cause, re-run. |
+| A master is broken *after* a successful `apply` | Roll **forward**: fix the component. The cluster is still serving; the other masters are healthy. |
+| The whole upgrade was a mistake | Restore etcd (below) or a VirtualBox snapshot |
+
+### Rolling back a worker
+
+```bash
+./deploy.sh rollback 1.33 worker-1     # one worker
+./deploy.sh rollback 1.33              # every worker, one at a time
+```
+
+Per node: cordon → PDB-aware drain → reinstall `kubeadm`/`kubelet`/`kubectl` at the older
+minor → restart kubelet → uncordon → health gate. Same disruption rules as the upgrade,
+so traffic is unaffected.
+
+This is safe because **a kubelet may run up to 3 minors behind the API server**. An old
+worker under a new control plane is a supported, boring state — the reverse never is, so
+the command refuses a target newer than the control plane, or more than 3 minors behind it.
+
+One caveat: an older kubelet occasionally rejects a `/var/lib/kubelet/config.yaml` written
+by a newer control plane. The health gate catches it, and the fastest fix is to go forward
+again: `./deploy.sh upgrade 1.34 worker-1`.
+
+### Rolling back the control plane
+
+Only from a backup. Every `deploy.sh upgrade` run takes an etcd snapshot first and pulls
+it back to `backups/etcd-<timestamp>.db` on your workstation — that file *is* your
+rollback plan, and it contains every Secret in the cluster, so treat it accordingly
+(`backups/` is gitignored).
+
+**Option 1 — VirtualBox snapshots (simplest, use this in a lab).** Before the upgrade,
+power off all three masters and snapshot them. To roll back, restore all three to that
+snapshot, boot them, and let etcd re-form quorum. Any cluster changes made after the
+snapshot are gone.
+
+```bash
+VBoxManage snapshot k8s-master-1 take pre-1.34 --pause      # repeat for 2 and 3
+# rollback:
+VBoxManage snapshot k8s-master-1 restore pre-1.34           # repeat, then start all three
+```
+
+**Option 2 — restore the etcd snapshot.** Stacked etcd means restoring on *every* master.
+Do this on all three at once, in a maintenance window, with the cluster already unusable:
+
+```bash
+# on EVERY master, from the copy in backups/
+sudo systemctl stop kubelet
+sudo mv /var/lib/etcd /var/lib/etcd.broken
+
+sudo etcdutl snapshot restore /root/etcd-<timestamp>.db \
+  --name master-1 \
+  --initial-cluster master-1=https://192.168.1.180:2380,master-2=https://192.168.1.181:2380,master-3=https://192.168.1.182:2380 \
+  --initial-advertise-peer-urls https://192.168.1.180:2380 \
+  --data-dir /var/lib/etcd
+# ^ change --name and --initial-advertise-peer-urls per master
+
+sudo systemctl start kubelet
+```
+
+Then downgrade the control-plane packages to the old minor on each master
+(`apt-get install -y --allow-downgrades kubeadm=1.33.13-1.1 kubelet=1.33.13-1.1 kubectl=1.33.13-1.1`)
+and restart kubelet. `etcdutl` is `etcdctl snapshot restore` on older etcd builds.
+
+Everything written to the cluster after the snapshot — new Deployments, scaled replicas,
+new Secrets — is lost. That is why the practical answer in production is almost always
+roll forward, and why the per-node upgrade flow exists: you find out on one node, with the
+other five still on the old version, before there is anything to roll back.
+
+### Making rollback unnecessary
+
+* Upgrade **one node per run** and verify between (`./deploy.sh upgrade 1.34 worker-1`).
+* Start with a worker that carries no critical workload, and keep it there for a while.
+* Do the three hops to 1.36 on separate days, not in one window.
+* Keep the etcd snapshot from before *each* hop, not just the first.
 
 ### If something goes wrong
 

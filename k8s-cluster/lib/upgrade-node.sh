@@ -2,9 +2,11 @@
 # Runs AS ROOT on one node during a minor-version upgrade.
 # usage: upgrade-node.sh <minor> <phase>
 #   minor  target minor version, e.g. 1.34
-#   phase  apply   -- first control-plane node: kubeadm + 'kubeadm upgrade apply'
-#          node    -- every other node:         kubeadm + 'kubeadm upgrade node'
-#          kubelet -- kubelet/kubectl packages + restart (run while drained)
+#   phase  apply     -- first control-plane node: kubeadm + 'kubeadm upgrade apply'
+#          node      -- every other node:         kubeadm + 'kubeadm upgrade node'
+#          kubelet   -- kubelet/kubectl packages + restart (run while drained)
+#          downgrade -- WORKERS ONLY: put kubeadm/kubelet/kubectl back on an
+#                       older minor (kubeadm cannot downgrade a control plane)
 set -euo pipefail
 
 MINOR="$1"
@@ -56,6 +58,23 @@ case "$PHASE" in
     fi
     ;;
 
+  downgrade)
+    # Worker rollback: put the apt repo back on the older minor and install the
+    # whole trio at that version. Only valid for workers -- kubeadm does not
+    # support downgrading a control-plane node.
+    repo_switch
+    PKG="$(pkg_version)"
+    [ -n "$PKG" ] || { echo "no packages for ${MINOR}.x in the repo" >&2; exit 1; }
+    say "downgrading kubeadm/kubelet/kubectl to ${PKG}"
+    apt-mark unhold kubeadm kubelet kubectl >/dev/null 2>&1 || true
+    apt-get install -y -qq --allow-change-held-packages --allow-downgrades \
+      "kubeadm=${PKG}" "kubelet=${PKG}" "kubectl=${PKG}"
+    apt-mark hold kubeadm kubelet kubectl >/dev/null
+    systemctl daemon-reload
+    systemctl restart kubelet
+    say "kubelet restarted: $(kubelet --version)"
+    ;;
+
   kubelet)
     PKG="$(pkg_version)"
     [ -n "$PKG" ] || { echo "no kubelet package for ${MINOR}.x in the repo" >&2; exit 1; }
@@ -68,5 +87,5 @@ case "$PHASE" in
     say "kubelet restarted: $(kubelet --version)"
     ;;
 
-  *) echo "unknown phase '$PHASE' (apply|node|kubelet)" >&2; exit 1 ;;
+  *) echo "unknown phase '$PHASE' (apply|node|kubelet|downgrade)" >&2; exit 1 ;;
 esac

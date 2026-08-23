@@ -8,6 +8,7 @@
 #    ./deploy.sh add worker-2           re-add a node listed in cluster.conf
 #    ./deploy.sh upgrade 1.34           upgrade every node, one at a time
 #    ./deploy.sh upgrade 1.34 master-1  upgrade a SINGLE node, then stop
+#    ./deploy.sh rollback 1.33 worker-1 roll a WORKER back (masters: see README)
 #    ./deploy.sh status                 nodes / unhealthy pods / etcd / VIP
 #    ./deploy.sh kubeconfig             re-fetch the admin kubeconfig
 #    ./deploy.sh reset [label]          tear down every node, or just one
@@ -877,6 +878,120 @@ ${chain}"
 EOF
 }
 
+# =============================================================== rollback ===
+# What can honestly be rolled back, and what cannot:
+#
+#   WORKERS      -- yes. Drain, reinstall the older kubeadm/kubelet/kubectl,
+#                   restart, uncordon. A kubelet may run up to 3 minors behind
+#                   the API server, so an old worker in a new cluster is a
+#                   supported, boring state.
+#   CONTROL PLANE-- no. 'kubeadm upgrade apply' is one-way: it rewrites static
+#                   pod manifests, the kubeadm-config ConfigMap and etcd's
+#                   schema. Going back means restoring the etcd snapshot (or a
+#                   VM snapshot) -- see 'rollback' in the README.
+#
+# So this command rolls back workers, and refuses masters with instructions
+# rather than doing something that half-works.
+cmd_rollback() {
+  local target="${1:-}" only="${2:-}" answer i j idx cp_n tgt_n cur_n
+  [ -n "$target" ] || die "usage: $0 rollback <minor> [worker]   e.g. $0 rollback 1.33 worker-1"
+  [[ "$target" =~ ^1\.[0-9]+$ ]] || die "give a minor version like 1.33, not '$target'"
+  require_cluster
+  upg_load_versions
+  tgt_n="${target#1.}"
+
+  cp_n="$(upg_minor "$(upg_ver "$FIRST_MASTER_NAME")")"
+  if [ "$tgt_n" -gt "$cp_n" ]; then
+    die "the control plane is on 1.${cp_n}.x -- a kubelet must never be newer than the API server"
+  fi
+  if [ "$((cp_n - tgt_n))" -gt 3 ]; then
+    die "1.${tgt_n} is more than 3 minors behind the control plane (1.${cp_n}) -- outside the supported kubelet skew"
+  fi
+
+  local targets=()
+  if [ -n "$only" ]; then
+    idx="$(idx_of "$only")" || die "unknown node label: $only"
+    if [ "${ROLES[$idx]}" = master ]; then
+      die "$only is a control-plane node and kubeadm cannot downgrade one.
+       'kubeadm upgrade apply' rewrote the static pod manifests, the
+       kubeadm-config ConfigMap and etcd's stored schema; reinstalling older
+       packages on top of that gives you a broken master, not an old one.
+       Your real options, in order of preference:
+         1. Roll FORWARD -- fix the failing component; the cluster is still serving.
+         2. Restore the etcd snapshot this tool took before the upgrade:
+              $SCRIPT_DIR/backups/
+            See 'Rolling back' in the README for the full procedure.
+         3. Restore a VirtualBox snapshot of ALL masters taken powered-off
+            before the upgrade -- the cleanest option in a lab.
+       Workers can be rolled back:  $0 rollback $target worker-1"
+    fi
+    targets=("$idx")
+  else
+    for i in "${!NAMES[@]}"; do
+      if [ "${ROLES[$i]}" = worker ]; then targets+=("$i"); fi
+    done
+    [ "${#targets[@]}" -gt 0 ] || die "no workers to roll back"
+    warn "this rolls back WORKERS only -- masters stay on their current version (see the README)"
+  fi
+
+  # Anything actually to do?
+  local todo=()
+  for i in "${targets[@]}"; do
+    cur_n="$(upg_minor "$(upg_ver "${NAMES[$i]}")")"
+    if [ "$cur_n" -le "$tgt_n" ]; then
+      ok "${NAMES[$i]} is already on $(upg_ver "${NAMES[$i]}") -- nothing to do"
+    else
+      todo+=("$i")
+    fi
+  done
+  [ "${#todo[@]}" -gt 0 ] || { step "nothing to roll back"; return 0; }
+
+  step "rollback plan -> ${target}.x"
+  printf '  workers:'; for i in "${todo[@]}"; do printf ' %s(%s)' "${NAMES[$i]}" "$(upg_ver "${NAMES[$i]}")"; done; echo
+  echo "  Per node: cordon -> PDB-aware drain -> older packages -> restart kubelet -> uncordon -> health gate"
+  echo "  The control plane stays on 1.${cp_n}.x; old kubelets under a newer API server is a supported state."
+  wait_settled "the pre-rollback check" 300 || die "the cluster is not healthy right now -- fix that first"
+  if [ "${FORCE:-no}" != yes ]; then
+    [ -t 0 ] || die "not a terminal: re-run with FORCE=yes to confirm"
+    read -r -p "  Type 'yes' to begin: " answer
+    [ "$answer" = yes ] || { log "aborted"; return 0; }
+  fi
+
+  for j in "${!todo[@]}"; do
+    i="${todo[$j]}"
+    local name="${NAMES[$i]}" ip="${IPS[$i]}"
+    step "$name $(upg_ver "$name") -> ${target}"
+
+    log "cordoning $name"
+    kctl "kubectl cordon $name" >/dev/null
+    log "draining $name (PDB-aware, timeout ${DRAIN_TIMEOUT}s)"
+    if ! kctl "kubectl drain $name --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT}s" >/dev/null 2>&1; then
+      kctl "kubectl uncordon $name" >/dev/null || true
+      die "drain of $name did not complete -- $name is uncordoned and unchanged.
+       Look at:  kubectl get pods -A --field-selector spec.nodeName=$name"
+    fi
+    run_script "$ip" "$SCRIPT_DIR/lib/upgrade-node.sh" "$target" downgrade \
+      || die "package downgrade failed on $name (still cordoned and empty).
+       Check 'journalctl -xeu kubelet' there; the rest of the cluster is untouched."
+    kctl "kubectl uncordon $name" >/dev/null
+    kctl "kubectl wait --for=condition=Ready node/$name --timeout=300s" >/dev/null \
+      || die "$name did not return Ready on ${target} -- an older kubelet can reject a config
+       written by a newer control plane. Fastest fix is to go forward again:
+         $0 upgrade 1.${cp_n} $name"
+    wait_settled "$name rolling back" 600 || die "cluster not healthy after $name -- stopping here"
+    upg_load_versions
+    ok "$name is on $(upg_ver "$name")"
+    if [ "$j" -lt "$(( ${#todo[@]} - 1 ))" ] && [ "${SOAK:-0}" -gt 0 ]; then
+      log "soaking ${SOAK}s before the next node"
+      sleep "$SOAK"
+    fi
+  done
+
+  step "rollback complete"
+  warn "K8S_VERSION in $CONFIG is unchanged -- set it by hand if these versions are now the intended baseline"
+  cmd_status
+}
+
 # ================================================================== reset ===
 cmd_reset() {
   local only="${1:-}" i tip answer
@@ -966,6 +1081,7 @@ case "${1:-deploy}" in
   lb)         setup_lb ;;
   add)        shift; cmd_add "$@" ;;
   upgrade)    shift; cmd_upgrade "${1:-}" "${2:-}" ;;
+  rollback)   shift; cmd_rollback "${1:-}" "${2:-}" ;;
   status)     cmd_status ;;
   kubeconfig) cmd_kubeconfig ;;
   reset)      shift; cmd_reset "${1:-}" ;;
