@@ -6,6 +6,7 @@
 #    ./deploy.sh deploy                 build the whole cluster   (default)
 #    ./deploy.sh add worker-4 IP [k=v]  add a brand-new node
 #    ./deploy.sh add worker-2           re-add a node listed in cluster.conf
+#    ./deploy.sh upgrade 1.34           upgrade the cluster ONE minor version
 #    ./deploy.sh status                 nodes / unhealthy pods / etcd / VIP
 #    ./deploy.sh kubeconfig             re-fetch the admin kubeconfig
 #    ./deploy.sh reset [label]          tear down every node, or just one
@@ -114,6 +115,16 @@ _scp() {
     sshpass -p "$SSH_PASSWORD" scp "${SSH_OPTS[@]}" ${SSH_KEY:+-i "$SSH_KEY"} -P "$SSH_PORT" -q "$src" "${SSH_USER}@${ip}:${dst}"
   else
     scp "${SSH_OPTS[@]}" ${SSH_KEY:+-i "$SSH_KEY"} -P "$SSH_PORT" -q "$src" "${SSH_USER}@${ip}:${dst}"
+  fi
+}
+
+# pull a file back from a node (used for the etcd snapshot)
+_scp_from() {
+  local ip="$1" src="$2" dst="$3"
+  if [ -n "$SSH_PASSWORD" ]; then
+    sshpass -p "$SSH_PASSWORD" scp "${SSH_OPTS[@]}" ${SSH_KEY:+-i "$SSH_KEY"} -P "$SSH_PORT" -q "${SSH_USER}@${ip}:${src}" "$dst"
+  else
+    scp "${SSH_OPTS[@]}" ${SSH_KEY:+-i "$SSH_KEY"} -P "$SSH_PORT" -q "${SSH_USER}@${ip}:${src}" "$dst"
   fi
 }
 
@@ -576,6 +587,224 @@ cmd_add() {
   cmd_status
 }
 
+# ================================================================ upgrade ===
+# Production-grade, one minor version per run (kubeadm cannot skip minors).
+#
+# The whole design goal is that a client hitting your app never notices:
+#   * one node at a time, never two -- capacity only ever dips by 1/N
+#   * eviction goes through PodDisruptionBudgets, so a Deployment never drops
+#     below its minAvailable; drain WAITS instead of killing replicas
+#   * no --force: pods with no controller would be deleted outright, not moved
+#   * after each node, the cluster must be fully healthy again, plus a soak
+#     window, before the next node is touched
+#   * the API server stays reachable because masters go one at a time and
+#     HAProxy health-checks route around the one being upgraded
+#
+# Knobs:  SOAK=120  DRAIN_TIMEOUT=900  SKIP_BACKUP=no  FORCE=yes (non-interactive)
+: "${SOAK:=120}"
+: "${DRAIN_TIMEOUT:=900}"
+: "${SKIP_BACKUP:=no}"
+
+health_facts() { run_script "$FIRST_MASTER_IP" "$SCRIPT_DIR/lib/cluster-health.sh" health 2>/dev/null | tr -d '\r'; }
+risk_facts()   { run_script "$FIRST_MASTER_IP" "$SCRIPT_DIR/lib/cluster-health.sh" risk   2>/dev/null | tr -d '\r'; }
+fact()         { sed -n "s/^$1=//p" <<<"$2" | tail -1; }
+
+# Block until every node is Ready, every pod is Running/Completed, every
+# Deployment has all replicas available, and etcd has full membership.
+wait_settled() {   # <what> <timeout-seconds>
+  local what="$1" timeout="${2:-600}" waited=0 f notready badpods unavail members healthy
+  while :; do
+    f="$(health_facts)"
+    notready="$(fact NOTREADY "$f")"; badpods="$(fact BADPODS "$f")"
+    unavail="$(fact UNAVAILABLE "$f")"
+    members="$(fact ETCD_MEMBERS "$f")"; healthy="$(fact ETCD_HEALTHY "$f")"
+    if [ -z "$notready" ] && [ -z "$badpods" ] && [ -z "$unavail" ] \
+       && [ "${members:-0}" -gt 0 ] && [ "${healthy:-0}" = "${members:-0}" ]; then
+      ok "cluster settled after $what (etcd ${healthy}/${members} healthy)"
+      return 0
+    fi
+    [ "$waited" -ge "$timeout" ] && {
+      err "cluster did not settle after $what within ${timeout}s:"
+      [ -n "$notready" ] && echo "      nodes not Ready : $notready" >&2
+      [ -n "$badpods" ]  && echo "      pods not Running: $badpods"  >&2
+      [ -n "$unavail" ]  && echo "      deployments degraded: $unavail" >&2
+      [ "${healthy:-0}" = "${members:-0}" ] || echo "      etcd healthy ${healthy}/${members}" >&2
+      return 1
+    }
+    sleep 15; waited=$((waited + 15))
+    printf '  %swaiting for %s to settle (%ss)%s\r' "$C_D" "$what" "$waited" "$C_0"
+  done
+}
+
+# Snapshot etcd and pull the file back to the workstation before we touch anything.
+etcd_backup() {
+  local stamp="$1" out="$SCRIPT_DIR/backups/etcd-${stamp}.db"
+  mkdir -p "$SCRIPT_DIR/backups"
+  log "taking an etcd snapshot"
+  rroot "$FIRST_MASTER_IP" "
+P=\$(kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get pods -l component=etcd -o name | head -1 | cut -d/ -f2)
+kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system exec \$P -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  snapshot save /var/lib/etcd/upgrade-snapshot.db
+cp /var/lib/etcd/upgrade-snapshot.db /tmp/etcd-snapshot.db
+chmod 644 /tmp/etcd-snapshot.db
+" >/dev/null || die "etcd snapshot failed -- refusing to upgrade without a backup (SKIP_BACKUP=yes overrides)"
+  _scp_from "$FIRST_MASTER_IP" /tmp/etcd-snapshot.db "$out" || die "could not fetch the etcd snapshot"
+  ok "etcd snapshot saved to $out ($(du -h "$out" 2>/dev/null | cut -f1))"
+}
+
+# Report what WILL be disrupted, so the operator decides before, not during.
+upgrade_risk_report() {
+  local r single nopdb coredns pdbs risky=0
+  r="$(risk_facts)"
+  single="$(sed -n 's/^SINGLE=//p' <<<"$r")"
+  nopdb="$(sed -n 's/^NOPDB=//p' <<<"$r")"
+  coredns="$(fact COREDNS "$r")"; pdbs="$(fact PDBS "$r")"
+
+  step "disruption risk"
+  if [ -n "$single" ]; then
+    warn "these workloads run a SINGLE replica -- they WILL have a gap when their node drains:"
+    printf '      %s\n' $single >&2
+    risky=1
+  else ok "no single-replica workloads outside kube-system"; fi
+
+  if [ -n "$nopdb" ]; then
+    warn "namespaces with workloads but no PodDisruptionBudget (drain will evict freely):"
+    printf '      %s\n' $nopdb >&2
+    risky=1
+  else ok "every workload namespace has at least one PDB"; fi
+
+  if [ "${coredns:-0}" -lt 2 ]; then
+    warn "CoreDNS has ${coredns:-0} replica(s) -- DNS lookups will fail during its restart"
+    risky=1
+  else ok "CoreDNS runs ${coredns} replicas"; fi
+  log "PodDisruptionBudgets in the cluster: ${pdbs:-0}"
+
+  if [ "$risky" = 1 ]; then
+    cat >&2 <<EOF
+
+  To make this a genuinely zero-impact upgrade, fix the above first:
+      kubectl scale deploy/<name> --replicas=2 -n <ns>
+      kubectl create poddisruptionbudget <name> --selector=app=<app> --min-available=1 -n <ns>
+      kubectl -n kube-system scale deploy/coredns --replicas=2
+  Add topologySpreadConstraints or podAntiAffinity so replicas land on
+  different nodes -- two replicas on one node drain together.
+EOF
+  fi
+}
+
+cmd_upgrade() {
+  local target="${1:-}" cur cur_n tgt_n i name ip phase answer stamp
+  [ -n "$target" ] || die "usage: $0 upgrade <minor>   e.g. $0 upgrade 1.34"
+  [[ "$target" =~ ^1\.[0-9]+$ ]] || die "give a minor version like 1.34, not '$target'"
+  require_cluster
+
+  cur="$(rroot "$FIRST_MASTER_IP" 'kubeadm version -o short' | tr -d '\rv' | tail -1)"
+  cur_n="${cur#1.}"; cur_n="${cur_n%%.*}"
+  tgt_n="${target#1.}"
+  [ "$tgt_n" -gt "$cur_n" ] || die "cluster is already on v${cur} -- kubeadm cannot downgrade"
+  if [ "$tgt_n" -ne "$((cur_n + 1))" ]; then
+    local chain="" n
+    for ((n = cur_n + 1; n <= tgt_n; n++)); do chain+="         ./deploy.sh upgrade 1.${n}"$'\n'; done
+    die "kubeadm cannot skip minor versions: v${cur} -> ${target}.x is $((tgt_n - cur_n)) hops.
+       Run them in order, verifying the cluster and your app between each:
+${chain}"
+  fi
+
+  step "pre-upgrade checks (v${cur} -> ${target}.x)"
+  if [ "${#MASTER_NAMES[@]}" -lt 3 ]; then
+    warn "${#MASTER_NAMES[@]} master(s): the API server WILL be unavailable while it upgrades. 3 masters is the zero-downtime minimum."
+  fi
+  if [ "${#WORKER_NAMES[@]}" -lt 2 ]; then
+    warn "${#WORKER_NAMES[@]} worker(s): pods evicted from the only worker have nowhere to go."
+  fi
+  wait_settled "the pre-upgrade check" 300 || die "the cluster is not healthy right now -- fix it before upgrading"
+  upgrade_risk_report
+
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  if [ "$SKIP_BACKUP" != yes ]; then etcd_backup "$stamp"; else warn "SKIP_BACKUP=yes -- no etcd snapshot taken"; fi
+
+  step "upgrade plan"
+  cat <<EOF
+  ${#MASTER_NAMES[@]} masters then ${#WORKER_NAMES[@]} workers, strictly one node at a time:
+      kubeadm -> upgrade -> cordon -> drain (respecting PDBs) -> kubelet -> uncordon
+      -> wait for the whole cluster to be healthy -> soak ${SOAK}s -> next node
+  drain timeout ${DRAIN_TIMEOUT}s; a drain that a PDB blocks ABORTS the run rather
+  than forcing eviction, so capacity is never removed from under your app.
+EOF
+  if [ "${FORCE:-no}" != yes ]; then
+    [ -t 0 ] || die "not a terminal: re-run with FORCE=yes to confirm"
+    read -r -p "  Type 'yes' to begin: " answer
+    [ "$answer" = yes ] || { log "aborted"; return 0; }
+  fi
+
+  for i in "${!NAMES[@]}"; do
+    name="${NAMES[$i]}"; ip="${IPS[$i]}"
+    node_joined "$name" || { warn "$name is not a cluster member -- skipping"; continue; }
+    if [ "${ROLES[$i]}" = master ] && [ "$name" = "$FIRST_MASTER_NAME" ]; then phase=apply; else phase=node; fi
+
+    step "$name (${ROLES[$i]}) -> ${target}"
+
+    # 1. control-plane components first; the node keeps serving while this runs
+    run_script "$ip" "$SCRIPT_DIR/lib/upgrade-node.sh" "$target" "$phase" \
+      || die "kubeadm upgrade failed on $name -- cluster left on v${cur}, other nodes untouched"
+    if [ "$phase" = apply ]; then
+      wait_settled "the control-plane upgrade on $name" 600 \
+        || die "control plane unhealthy after 'kubeadm upgrade apply' -- stopping before any node is drained"
+    fi
+
+    # 2. stop scheduling, then evict politely
+    log "cordoning $name"
+    kctl "kubectl cordon $name" >/dev/null
+    log "draining $name (PDB-aware, timeout ${DRAIN_TIMEOUT}s)"
+    if ! kctl "kubectl drain $name --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT}s" >/dev/null 2>&1; then
+      kctl "kubectl uncordon $name" >/dev/null || true
+      die "drain of $name did not complete -- a PodDisruptionBudget is holding pods, or a pod has no controller.
+       $name has been uncordoned and NOTHING was upgraded on it beyond kubeadm.
+       Inspect with:  kubectl get pods -A --field-selector spec.nodeName=$name
+       Then re-run the same command; already-upgraded nodes are no-ops."
+    fi
+    ok "$name drained, workloads rescheduled elsewhere"
+
+    # 3. kubelet, while the node carries no traffic
+    run_script "$ip" "$SCRIPT_DIR/lib/upgrade-node.sh" "$target" kubelet \
+      || die "kubelet upgrade failed on $name (node is still cordoned and empty)"
+
+    # 4. back into service, then prove the cluster is whole again
+    kctl "kubectl uncordon $name" >/dev/null
+    kctl "kubectl wait --for=condition=Ready node/$name --timeout=300s" >/dev/null \
+      || die "$name did not return Ready -- fix it before the next node"
+    wait_settled "$name rejoining" 600 \
+      || die "cluster not healthy after $name -- stopping here, remaining nodes untouched"
+    ok "$name is on ${target}"
+
+    # 5. soak: give autoscalers, caches and connection pools time to rebalance
+    if [ "$i" -lt "$(( ${#NAMES[@]} - 1 ))" ] && [ "${SOAK:-0}" -gt 0 ]; then
+      log "soaking ${SOAK}s before the next node (watch your dashboards)"
+      sleep "$SOAK"
+    fi
+  done
+
+  if grep -q "^K8S_VERSION=" "$CONFIG"; then
+    sed -i.bak -E "s|^K8S_VERSION=.*|K8S_VERSION=\"${target}\"|" "$CONFIG"
+    ok "K8S_VERSION in $CONFIG set to ${target}"
+  fi
+  step "upgrade to ${target} complete"
+  cmd_status
+  cat <<EOF
+
+  Post-upgrade checklist:
+    kubectl get nodes                       all on ${target}.x
+    kubectl get pods -A                     nothing restarting
+    kubectl -n kube-system get deploy coredns
+    your own smoke tests / SLO dashboards
+  etcd snapshot from before this run: $SCRIPT_DIR/backups/etcd-${stamp}.db
+EOF
+}
+
 # ================================================================== reset ===
 cmd_reset() {
   local only="${1:-}" i tip answer
@@ -664,6 +893,7 @@ case "${1:-deploy}" in
   prep)       prep_all ;;
   lb)         setup_lb ;;
   add)        shift; cmd_add "$@" ;;
+  upgrade)    shift; cmd_upgrade "${1:-}" ;;
   status)     cmd_status ;;
   kubeconfig) cmd_kubeconfig ;;
   reset)      shift; cmd_reset "${1:-}" ;;

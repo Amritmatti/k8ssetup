@@ -12,7 +12,9 @@ k8s-cluster/
 └── lib/
     ├── precheck.sh      runs on each VM: facts for preflight
     ├── node-prep.sh     runs on each VM: swap/sysctl/containerd/kubeadm
-    └── lb-setup.sh      runs on each master: HAProxy + Keepalived (the VIP)
+    ├── lb-setup.sh      runs on each master: HAProxy + Keepalived (the VIP)
+    ├── upgrade-node.sh  runs on each VM: repo switch + kubeadm/kubelet upgrade
+    └── cluster-health.sh runs on master-1: health + disruption-risk facts
 ```
 
 ## Resource requirements
@@ -168,6 +170,7 @@ worker-1   Ready    worker          3m    v1.33.x   192.168.1.183
 | `./deploy.sh add worker-4 192.168.1.186 zone=b` | prep + join a brand-new node (then add it to `cluster.conf`) |
 | `./deploy.sh add worker-2` | re-add a node that is already in `cluster.conf` |
 | `./deploy.sh add master-4 192.168.1.187` | joins a control-plane node and re-renders HAProxy |
+| `SOAK=300 ./deploy.sh upgrade 1.34` | zero-downtime upgrade, one minor version |
 | `./deploy.sh kubeconfig` | re-fetch the admin kubeconfig |
 | `./deploy.sh reset worker-2` | drain, delete, and `kubeadm reset` one node |
 | `FORCE=yes ./deploy.sh reset` | wipe Kubernetes from every VM (the VMs survive) |
@@ -211,6 +214,164 @@ kubectl -n kube-system exec -it etcd-master-1 -- etcdctl \
 **HA test:** `vagrant halt master-1` (or power it off in the VirtualBox GUI), wait ~5 s,
 then `kubectl get nodes` again. Keepalived moves the VIP to `master-2` and the API keeps
 answering; etcd holds quorum with 2 of 3 members.
+
+## Upgrading to a newer Kubernetes (production, zero downtime)
+
+**kubeadm cannot skip minor versions.** 1.33 → 1.36.4 is three separate upgrades:
+1.33 → 1.34 → 1.35 → 1.36. Patch releases come along for free — each hop installs the
+newest patch in that minor, so the last one lands on 1.36.4.
+
+```bash
+./deploy.sh upgrade 1.34     # verify the app, let it bake
+./deploy.sh upgrade 1.35
+./deploy.sh upgrade 1.36
+```
+
+Downtime comes from doing this carelessly, not from the upgrade itself. Four rules make
+it invisible to clients:
+
+| Rule | Why |
+|---|---|
+| One node at a time, never two | capacity dips by exactly 1/N and recovers before the next node |
+| Evict through PodDisruptionBudgets | drain **waits** rather than dropping a Deployment below `minAvailable` |
+| Never `kubectl drain --force` | `--force` deletes pods with no controller outright — they do not come back |
+| Health gate + soak between nodes | a degraded cluster must not meet the next disruption |
+
+`deploy.sh upgrade` enforces all four and aborts rather than pushing through.
+
+### What it does, in order
+
+**Before touching anything**
+
+1. Refuses to skip a minor, and refuses a downgrade.
+2. Warns if you have `< 3` masters (the API server genuinely goes away while a lone master
+   upgrades) or `< 2` workers (evicted pods have nowhere to land).
+3. **Health gate** — every node Ready, every pod Running/Completed, every Deployment at
+   full replicas, all etcd members healthy. An unhealthy cluster is never upgraded.
+4. **Disruption risk report** — lists workloads running a single replica, namespaces with
+   no PDB, and CoreDNS replica count, with the commands to fix each. These are the things
+   that cause a visible blip.
+5. **etcd snapshot**, pulled back to `backups/etcd-<timestamp>.db` on your workstation.
+   The run aborts if the snapshot fails (`SKIP_BACKUP=yes` overrides — don't, in prod).
+
+**Then per node — masters first, one at a time, workers after**
+
+1. `kubeadm` package → `kubeadm upgrade apply` (first master) or `kubeadm upgrade node`.
+   The node is still serving traffic here; only the control-plane components restart.
+   After `apply`, the cluster must be fully healthy again before any node is drained.
+2. `kubectl cordon` — stop new pods landing on it.
+3. `kubectl drain --ignore-daemonsets --delete-emptydir-data --timeout=900s`, **no
+   `--force`**. If a PDB blocks eviction, the run **uncordons the node and stops**, telling
+   you which pods are stuck. Capacity is never yanked out from under the app.
+4. `kubelet` + `kubectl` packages, `systemctl restart kubelet` — while the node is empty.
+5. `kubectl uncordon`, wait for Ready, then re-run the full health gate.
+6. **Soak** (`SOAK=120` by default) before the next node, so connection pools, HPAs and
+   caches rebalance while you watch your dashboards.
+
+Any failure stops the run with the remaining nodes untouched, on a cluster that is either
+fully on the old version or partially upgraded but healthy — both are safe states to sit
+in while you investigate. Re-running the same command resumes: nodes already on the target
+pass through as no-ops.
+
+### Knobs
+
+```bash
+SOAK=300 DRAIN_TIMEOUT=1800 ./deploy.sh upgrade 1.34   # slower, gentler
+FORCE=yes ./deploy.sh upgrade 1.34                     # no interactive confirmation
+SKIP_BACKUP=yes ./deploy.sh upgrade 1.34               # skip the etcd snapshot
+```
+
+### Make the cluster upgrade-safe first
+
+The script reports these; fixing them is what turns "brief blip" into "nothing happened":
+
+```bash
+# 1. no single-replica workloads
+kubectl scale deploy/<name> --replicas=2 -n <ns>
+
+# 2. a PDB per workload, so drain waits instead of evicting everything
+kubectl create poddisruptionbudget <name> --selector=app=<app> --min-available=1 -n <ns>
+
+# 3. spread replicas across nodes -- two replicas on ONE node drain together
+#    (in the pod template)
+#    topologySpreadConstraints:
+#      - maxSkew: 1
+#        topologyKey: kubernetes.io/hostname
+#        whenUnsatisfiable: DoNotSchedule
+#        labelSelector: { matchLabels: { app: <app> } }
+
+# 4. CoreDNS: every pod in the cluster depends on it
+kubectl -n kube-system scale deploy/coredns --replicas=2
+
+# 5. readiness probes that actually gate traffic, and
+#    terminationGracePeriodSeconds long enough to finish in-flight requests
+```
+
+Also check, before the first hop:
+
+* **Removed APIs** between your version and the target — this, not the mechanics, is what
+  breaks apps across three minors. Read each release's deprecation notes, and see what you
+  are still calling:
+  ```bash
+  kubectl get --raw /metrics | grep apiserver_requested_deprecated_apis
+  ```
+* **Calico's support matrix.** `CALICO_VERSION=v3.28.2` is not certified for 1.36 —
+  upgrade the CNI as its own change, after the cluster reaches the target version, and
+  never in the same maintenance window.
+* **Your workstation `kubectl`** may only be one minor behind the API server.
+
+### Manual equivalent
+
+If you would rather drive it by hand, this is exactly what the script runs. On **master-1**:
+
+```bash
+# repo -> new minor (the step everyone forgets; without it nothing upgrades)
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key \
+  | sudo gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /" \
+  | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update
+apt-cache madison kubeadm | head -3            # -> 1.34.1-1.1
+
+sudo apt-mark unhold kubeadm
+sudo apt-get install -y kubeadm=1.34.1-1.1
+sudo apt-mark hold kubeadm
+sudo kubeadm upgrade plan                      # read it
+sudo kubeadm upgrade apply v1.34.1
+
+kubectl cordon master-1
+kubectl drain master-1 --ignore-daemonsets --delete-emptydir-data --timeout=900s
+sudo apt-mark unhold kubelet kubectl
+sudo apt-get install -y kubelet=1.34.1-1.1 kubectl=1.34.1-1.1
+sudo apt-mark hold kubelet kubectl
+sudo systemctl daemon-reload && sudo systemctl restart kubelet
+kubectl uncordon master-1
+kubectl get nodes && kubectl get pods -A       # wait for green before the next node
+```
+
+Every other node is identical except `kubeadm upgrade apply v1.34.1` becomes:
+
+```bash
+sudo kubeadm upgrade node
+```
+
+Masters first, workers last, one at a time.
+
+### If something goes wrong
+
+* **Drain blocked by a PDB** — that is the safety net working. `kubectl get pods -A
+  --field-selector spec.nodeName=<node>` shows what is stuck; scale the workload up, or
+  relax `minAvailable`, then re-run. Do not reach for `--force`.
+* **A node will not come back Ready** — `journalctl -xeu kubelet`, re-run
+  `sudo kubeadm upgrade node`, then `kubectl uncordon <node>`. The rest of the cluster is
+  untouched and still serving.
+* **Control plane broken after `upgrade apply`** — restore the snapshot this run took:
+  ```bash
+  sudo etcdctl snapshot restore backups/etcd-<timestamp>.db --data-dir /var/lib/etcd-restore
+  # then point the etcd static pod at the restored data dir and restart kubelet
+  ```
+  A VirtualBox snapshot of all three masters, taken powered-off before the run, is the
+  cruder but far quicker rollback in a lab.
 
 ## Options in `cluster.conf`
 

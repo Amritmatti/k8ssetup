@@ -11,3 +11,4 @@ crash.log
 k8s-cluster/logs/
 k8s-cluster/.stage/
 k8s-cluster/kubeconfig
+k8s-cluster/backups/
