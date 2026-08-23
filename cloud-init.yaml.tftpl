@@ -1,0 +1,19 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - iptables-persistent
+%{ if install_nginx ~}
+  - nginx
+%{ endif ~}
+
+runcmd:
+  # OCI's Ubuntu image ships with a host firewall that only allows SSH.
+  # Open 80/443 there too, otherwise the NSG rules alone are not enough.
+  - iptables -I INPUT 5 -p tcp --dport 80  -m state --state NEW -j ACCEPT
+  - iptables -I INPUT 6 -p tcp --dport 443 -m state --state NEW -j ACCEPT
+  - netfilter-persistent save
+%{ if install_nginx ~}
+  - systemctl enable --now nginx
+%{ endif ~}

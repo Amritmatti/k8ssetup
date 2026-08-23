@@ -1,0 +1,28 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+
+# --- Auth (from the API key you created under your OCI user) ---
+tenancy_ocid     = "ocid1.tenancy.oc1..xxxxxxxx"
+user_ocid        = "ocid1.user.oc1..xxxxxxxx"
+fingerprint      = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"
+private_key_path = "C:/Users/DevOps-Admin/.oci/oci_api_key.pem"
+region           = "eu-frankfurt-1"
+
+# --- Where to build ---
+# Optional. Comment it out entirely to build in the tenancy's root compartment,
+# which is all a fresh free-tier tenancy has.
+# Console path: Identity & Security -> Compartments -> click one -> Copy OCID.
+# compartment_ocid = "ocid1.compartment.oc1..xxxxxxxx"
+project_name     = "demo"
+
+# --- Access ---
+# The ONLY source allowed to reach port 22. Put your own public IP here.
+ssh_allowed_cidr = "203.0.113.10/32"
+ssh_public_key   = "ssh-rsa AAAAB3Nza... you@host"
+
+# --- Sizing (4 OCPU / 24 GB) ---
+# VM.Standard.A1.Flex -> Ampere ARM, ALWAYS FREE at 4 OCPU / 24 GB
+# VM.Standard3.Flex   -> Intel x86_64, paid
+# VM.Standard.E5.Flex -> AMD x86_64, paid
+instance_shape         = "VM.Standard.A1.Flex"
+instance_ocpus         = 4
+instance_memory_in_gbs = 24
