@@ -12,6 +12,10 @@
 #    ./deploy.sh status                 nodes / unhealthy pods / etcd / VIP
 #    ./deploy.sh kubeconfig             re-fetch the admin kubeconfig
 #    ./deploy.sh reset [label]          tear down every node, or just one
+#    ./deploy.sh logs [node]            follow the per-node logs live
+#
+#    -v, --verbose                      stream every node's output as it
+#                                       happens, instead of only its log
 #
 #  Everything is driven by cluster.conf -- you only edit IPs and labels there.
 # =============================================================================
@@ -32,6 +36,58 @@ warn() { printf '%swarn%s %s\n'  "$C_Y" "$C_0" "$*" >&2; }
 err()  { printf '%sFAIL%s %s\n'  "$C_R" "$C_0" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 step() { printf '\n%s--- %s %s%s\n' "$C_B" "$*" "$(printf '%.0s-' $(seq 1 40))" "$C_0"; }
+
+# ------------------------------------------------------ live output ----
+# Parallel steps write per-node logs and show nothing until they finish, which
+# makes a slow node and a hung one look exactly the same from the terminal.
+# -v streams them as they happen; without it a ticker at least says the step
+# is still moving, and names the log to tail.
+VERBOSE="${VERBOSE:-no}"
+TICKER_PID=""
+
+# Run <cmd...> with its output captured to <logfile>. With -v the same output
+# also reaches the terminal, every line tagged with the node it came from --
+# six untagged streams at once are not readable.
+run_logged() {  # <name> <logfile> <cmd...>
+  local name="$1" logfile="$2"; shift 2
+  if [ "$VERBOSE" != yes ]; then
+    "$@" > "$logfile" 2>&1
+    return $?
+  fi
+  # pipefail so the status is the command's, not the tagging loop's; set in a
+  # subshell so it does not leak into the caller's shell.
+  (
+    set -o pipefail
+    "$@" 2>&1 | tee "$logfile" | while IFS= read -r line; do
+      printf '  %s%-10s |%s %s\n' "$C_D" "$name" "$C_0" "$line"
+    done
+  )
+}
+
+# A step that takes twenty minutes and one that has hung produce the same
+# silence. Tick while we wait, so the difference is visible.
+start_ticker() {  # <what>
+  TICKER_PID=""
+  if [ "$VERBOSE" = yes ]; then return 0; fi
+  local what="$1" start=$SECONDS
+  (
+    while :; do
+      sleep "${TICK_SECONDS:-30}"
+      local n=$(( SECONDS - start ))
+      printf '  %s.. still %s -- %dm%02ds elapsed; tail -f %s/*.log to watch%s\n' \
+        "$C_D" "$what" "$(( n / 60 ))" "$(( n % 60 ))" "$LOG_DIR" "$C_0"
+    done
+  ) &
+  TICKER_PID=$!
+}
+
+stop_ticker() {
+  if [ -n "${TICKER_PID:-}" ]; then
+    kill "$TICKER_PID" 2>/dev/null || true
+    wait "$TICKER_PID" 2>/dev/null || true
+  fi
+  TICKER_PID=""
+}
 
 # ---------------------------------------------------------------- config ----
 [ -f "$CONFIG" ] || die "config not found: $CONFIG"
@@ -230,10 +286,12 @@ prep_all() {
   mkdir -p "$LOG_DIR"; gen_hosts_file
   local i j rc=0 pids=() names=()
   for i in "${!NAMES[@]}"; do
-    ( prep_node "${NAMES[$i]}" "${IPS[$i]}" ) > "$LOG_DIR/prep-${NAMES[$i]}.log" 2>&1 &
+    ( run_logged "${NAMES[$i]}" "$LOG_DIR/prep-${NAMES[$i]}.log" \
+        prep_node "${NAMES[$i]}" "${IPS[$i]}" ) &
     pids+=("$!"); names+=("${NAMES[$i]}")
     printf '  %-10s %-16s %sworking...%s\n' "${NAMES[$i]}" "${IPS[$i]}" "$C_D" "$C_0"
   done
+  start_ticker "preparing nodes"
   for j in "${!pids[@]}"; do
     if wait "${pids[$j]}"; then ok "${names[$j]} ready"
     else
@@ -241,6 +299,7 @@ prep_all() {
       tail -n 15 "$LOG_DIR/prep-${names[$j]}.log" >&2; rc=1
     fi
   done
+  stop_ticker
   [ "$rc" -eq 0 ] || die "node preparation failed"
 }
 
@@ -479,9 +538,11 @@ join_all() {
     join_info
     mkdir -p "$LOG_DIR"
     for i in "${!WORKER_NAMES[@]}"; do
-      ( join_worker "${WORKER_NAMES[$i]}" "${WORKER_IPS[$i]}" ) > "$LOG_DIR/join-${WORKER_NAMES[$i]}.log" 2>&1 &
+      ( run_logged "${WORKER_NAMES[$i]}" "$LOG_DIR/join-${WORKER_NAMES[$i]}.log" \
+          join_worker "${WORKER_NAMES[$i]}" "${WORKER_IPS[$i]}" ) &
       pids+=("$!"); names+=("${WORKER_NAMES[$i]}")
     done
+    start_ticker "joining workers"
     for j in "${!pids[@]}"; do
       if wait "${pids[$j]}"; then ok "${names[$j]} joined"
       else
@@ -489,6 +550,7 @@ join_all() {
         tail -n 15 "$LOG_DIR/join-${names[$j]}.log" >&2; rc=1
       fi
     done
+    stop_ticker
     [ "$rc" -eq 0 ] || die "one or more workers failed to join"
   fi
 }
@@ -1070,9 +1132,39 @@ EOF
 }
 
 # print the header comment block, stopping at the first non-comment line
+cmd_logs() {  # [node]
+  local pat="${1:-}" files=()
+  if [ -d "$LOG_DIR" ]; then
+    local f
+    for f in "$LOG_DIR"/*.log; do
+      [ -e "$f" ] || continue
+      case "$pat" in
+        "")  files+=("$f") ;;
+        *)   case "$(basename "$f")" in *"$pat"*) files+=("$f") ;; esac ;;
+      esac
+    done
+  fi
+  if [ "${#files[@]}" -eq 0 ]; then
+    log "no logs in $LOG_DIR yet${pat:+ matching '$pat'}"
+    return 0
+  fi
+  log "following ${#files[@]} log(s) -- Ctrl-C to stop"
+  tail -n 20 -F "${files[@]}"
+}
+
 usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
 
 # =================================================================== main ===
+# Flags come before the command so `./deploy.sh -v deploy` reads the way it
+# looks; everything after the first non-flag is the command and its arguments.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -v|--verbose|--logs) VERBOSE=yes; shift ;;
+    --)                  shift; break ;;
+    *)                   break ;;
+  esac
+done
+
 parse_nodes
 case "${1:-deploy}" in
   deploy|"")  cmd_deploy ;;
@@ -1085,6 +1177,7 @@ case "${1:-deploy}" in
   status)     cmd_status ;;
   kubeconfig) cmd_kubeconfig ;;
   reset)      shift; cmd_reset "${1:-}" ;;
+  logs)       shift; cmd_logs "${1:-}" ;;
   -h|--help|help) usage ;;
   *) err "unknown command: $1"; usage; exit 1 ;;
 esac
