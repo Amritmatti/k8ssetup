@@ -14,6 +14,53 @@ say() { echo "  [$NODE_NAME] $*"; }
 # Never fail silently: report the exact line and command that died.
 trap 'rc=$?; echo "  [$NODE_NAME] ERROR at line $LINENO (exit $rc): $BASH_COMMAND" >&2; exit $rc' ERR
 
+# --- apt, on a machine that is still updating itself ----------------------
+# Ubuntu runs unattended-upgrades a few minutes into every boot, and it holds
+# the dpkg frontend lock for as long as its work takes. An apt-get that lands
+# in that window dies on the spot with "Could not get lock
+# /var/lib/dpkg/lock-frontend" - and because the nodes are prepared in
+# parallel, it kills whichever node drew the short straw, a different one
+# each run. That reads as a broken VM rather than the race it is.
+#
+# So wait for the lock instead of racing it. apt does the waiting itself;
+# the retry is for the apt too old to know that option, and for the upgrade
+# that takes the lock back in the gap between two of our calls.
+APT_LOCK_WAIT="${APT_LOCK_WAIT:-600}"    # seconds apt waits on a held lock
+APT_TRIES="${APT_TRIES:-5}"              # attempts before we give up on it
+APT_RETRY_WAIT="${APT_RETRY_WAIT:-30}"   # pause between them
+
+# Name the process sitting on the lock, so the wait is explainable.
+apt_lock_holder() {
+  local f p out=""
+  command -v fuser >/dev/null || { printf ' another process'; return 0; }
+  for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
+    for p in $(fuser "$f" 2>/dev/null || true); do
+      out="$out $(cat "/proc/$p/comm" 2>/dev/null || echo '?')($p)"
+    done
+  done
+  printf '%s' "${out:- another process}"
+}
+
+# Only a held lock is worth coming back for: a package that will not install
+# fails the same way five minutes from now, so let it fail at once.
+apt_run() {   # <apt-get|apt-mark> <args...>
+  local bin="$1"; shift
+  local out try=1 rc=0
+  out="$(mktemp)"
+  while :; do
+    rc=0
+    "$bin" -o DPkg::Lock::Timeout="$APT_LOCK_WAIT" "$@" >"$out" 2>&1 || rc=$?
+    cat "$out"
+    if [ "$rc" -eq 0 ] || [ "$try" -ge "$APT_TRIES" ]        || ! grep -qE 'Could not get lock|Unable to acquire' "$out"; then
+      rm -f "$out"; return "$rc"
+    fi
+    say "apt is locked by$(apt_lock_holder) -- retry $try/$APT_TRIES in ${APT_RETRY_WAIT}s"
+    sleep "$APT_RETRY_WAIT"; try=$((try + 1))
+  done
+}
+apt_get()  { apt_run apt-get  "$@"; }
+apt_mark() { apt_run apt-mark "$@"; }
+
 # --- sanity ---------------------------------------------------------------
 command -v apt-get >/dev/null || { echo "ERROR: only Debian/Ubuntu supported"; exit 1; }
 ip -4 -o addr show | grep -qw "$NODE_IP" || {
@@ -60,13 +107,13 @@ sysctl --system >/dev/null
 
 # --- base packages --------------------------------------------------------
 say "apt update + base packages"
-apt-get update -qq
-apt-get install -y -qq apt-transport-https ca-certificates curl gnupg socat conntrack ethtool
+apt_get update -qq
+apt_get install -y -qq apt-transport-https ca-certificates curl gnupg socat conntrack ethtool
 
 # --- containerd -----------------------------------------------------------
 if ! command -v containerd >/dev/null; then
   say "installing containerd"
-  apt-get install -y -qq containerd
+  apt_get install -y -qq containerd
 fi
 mkdir -p /etc/containerd
 if [ ! -f /etc/containerd/config.toml ] || ! grep -q SystemdCgroup /etc/containerd/config.toml; then
@@ -91,9 +138,9 @@ if ! command -v kubeadm >/dev/null; then
   chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
   echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/ /" \
     > /etc/apt/sources.list.d/kubernetes.list
-  apt-get update -qq
-  apt-get install -y -qq kubelet kubeadm kubectl
-  apt-mark hold kubelet kubeadm kubectl >/dev/null
+  apt_get update -qq
+  apt_get install -y -qq kubelet kubeadm kubectl
+  apt_mark hold kubelet kubeadm kubectl >/dev/null
 fi
 
 # --- pin kubelet to the right NIC (critical on multi-NIC VirtualBox VMs) --

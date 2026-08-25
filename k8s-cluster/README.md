@@ -527,5 +527,14 @@ segment.
 **Node joins with the wrong IP** — `/etc/default/kubelet` should contain
 `--node-ip=<host-only IP>`; re-run `./deploy.sh prep` and `systemctl restart kubelet`.
 
+**`E: Could not get lock /var/lib/dpkg/lock-frontend ... (unattended-upgr)`** — Ubuntu's
+own updater got to apt first. It runs a few minutes into every boot, so on a parallel prep
+it takes out whichever node happened to call apt inside that window, a different one each
+run. The prep scripts now wait for the lock (up to 10 minutes per call, then five retries)
+instead of racing it, so a run should no longer die here. A node that still fails this way
+has something holding the lock for the best part of an hour — `systemctl disable --now
+unattended-upgrades apt-daily.timer apt-daily-upgrade.timer` on the boxes, or bake that
+into the image, if you would rather not wait at all.
+
 **Running the scripts from Windows** — use Git Bash or WSL, and make sure the files keep
 LF endings (`git config core.autocrlf input`, or `dos2unix deploy.sh lib/*.sh`).
