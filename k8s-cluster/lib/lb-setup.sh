@@ -9,12 +9,53 @@ export DEBIAN_FRONTEND=noninteractive
 say() { echo "  [lb $NODE_IP] $*"; }
 trap 'rc=$?; echo "  [lb $NODE_IP] ERROR at line $LINENO (exit $rc): $BASH_COMMAND" >&2; exit $rc' ERR
 
+# --- apt, on a machine that is still updating itself ----------------------
+# unattended-upgrades holds the dpkg lock and kills any apt-get that lands in
+# its window; wait for the lock rather than racing it. The long version of
+# this comment, and the same helper, live in node-prep.sh -- each of these
+# scripts is copied to a node and run on its own, so it carries its own copy.
+APT_LOCK_WAIT="${APT_LOCK_WAIT:-600}"    # seconds apt waits on a held lock
+APT_TRIES="${APT_TRIES:-5}"              # attempts before we give up on it
+APT_RETRY_WAIT="${APT_RETRY_WAIT:-30}"   # pause between them
+
+# Name the process sitting on the lock, so the wait is explainable.
+apt_lock_holder() {
+  local f p out=""
+  command -v fuser >/dev/null || { printf ' another process'; return 0; }
+  for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
+    for p in $(fuser "$f" 2>/dev/null || true); do
+      out="$out $(cat "/proc/$p/comm" 2>/dev/null || echo '?')($p)"
+    done
+  done
+  printf '%s' "${out:- another process}"
+}
+
+# Only a held lock is worth coming back for: a package that will not install
+# fails the same way five minutes from now, so let it fail at once.
+apt_run() {   # <apt-get|apt-mark> <args...>
+  local bin="$1"; shift
+  local out try=1 rc=0
+  out="$(mktemp)"
+  while :; do
+    rc=0
+    "$bin" -o DPkg::Lock::Timeout="$APT_LOCK_WAIT" "$@" >"$out" 2>&1 || rc=$?
+    cat "$out"
+    if [ "$rc" -eq 0 ] || [ "$try" -ge "$APT_TRIES" ]        || ! grep -qE 'Could not get lock|Unable to acquire' "$out"; then
+      rm -f "$out"; return "$rc"
+    fi
+    say "apt is locked by$(apt_lock_holder) -- retry $try/$APT_TRIES in ${APT_RETRY_WAIT}s"
+    sleep "$APT_RETRY_WAIT"; try=$((try + 1))
+  done
+}
+apt_get()  { apt_run apt-get  "$@"; }
+apt_mark() { apt_run apt-mark "$@"; }
+
 IFACE="$(ip -4 -o addr show | awk -v ip="$NODE_IP" '$4 ~ "^"ip"/" {print $2; exit}')"
 [ -n "$IFACE" ] || { echo "ERROR: no interface holds $NODE_IP"; exit 1; }
 say "VIP $VIP on $IFACE (priority $PRIORITY)"
 
-apt-get update -qq
-apt-get install -y -qq haproxy keepalived
+apt_get update -qq
+apt_get install -y -qq haproxy keepalived
 
 # ---------------- HAProxy ----------------
 cat > /etc/haproxy/haproxy.cfg <<EOF
@@ -71,7 +112,7 @@ fi
 exit 0
 EOF
 chmod +x /etc/keepalived/check_apiserver.sh
-apt-get install -y -qq netcat-openbsd >/dev/null 2>&1 || apt-get install -y -qq netcat >/dev/null 2>&1 || true
+apt_get install -y -qq netcat-openbsd >/dev/null 2>&1 || apt_get install -y -qq netcat >/dev/null 2>&1 || true
 
 cat > /etc/keepalived/keepalived.conf <<EOF
 global_defs {
