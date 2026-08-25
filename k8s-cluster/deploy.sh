@@ -16,6 +16,10 @@
 #
 #    -v, --verbose                      stream every node's output as it
 #                                       happens, instead of only its log
+#    -m, --masters N                    build with only the FIRST N masters
+#    -w, --workers N                    and N workers of those cluster.conf
+#                                       lists -- e.g. -m 1 -w 3 for a
+#                                       single-master lab. Default: all.
 #
 #  Everything is driven by cluster.conf -- you only edit IPs and labels there.
 # =============================================================================
@@ -105,6 +109,9 @@ source "$CONFIG"
 NAMES=(); IPS=(); ROLES=(); XLABELS=()
 MASTER_NAMES=(); MASTER_IPS=(); WORKER_NAMES=(); WORKER_IPS=()
 
+# Set by --masters/--workers. Empty means "every node cluster.conf defines".
+WANT_MASTERS=""; WANT_WORKERS=""
+
 parse_nodes() {
   local entry name ip labels role dup
   for entry in "${NODES[@]}"; do
@@ -127,6 +134,8 @@ parse_nodes() {
   dup="$(printf '%s\n' "${IPS[@]}"   | sort | uniq -d)"; [ -z "$dup" ] || die "duplicate IP(s): $dup"
   dup="$(printf '%s\n' "${NAMES[@]}" | sort | uniq -d)"; [ -z "$dup" ] || die "duplicate label(s): $dup"
 
+  select_nodes
+
   FIRST_MASTER_NAME="${MASTER_NAMES[0]}"
   FIRST_MASTER_IP="${MASTER_IPS[0]}"
   if [ -n "$VIP" ]; then
@@ -147,8 +156,67 @@ parse_nodes() {
     CP_ENDPOINT="${FIRST_MASTER_IP}:6443"; USE_LB=no
     [ "${#MASTER_IPS[@]}" -le 1 ] || die "a multi-master cluster needs VIP set in $CONFIG"
   fi
+  # A single master with the VIP still configured is deliberate, not an oversight:
+  # kubeadm bakes controlPlaneEndpoint in at init, so a cluster initialised
+  # straight against <master-ip>:6443 can never gain a second master without a
+  # full re-init. Pointing even a one-master cluster at the VIP keeps
+  # './deploy.sh add master-2 <ip>' open. Set VIP="" only if you never will.
+  if [ "$USE_LB" = yes ] && [ "${#MASTER_IPS[@]}" -eq 1 ]; then
+    log "one master behind $VIP -- keepalived will hold the VIP permanently"
+    log "  the control plane stays growable: ./deploy.sh add master-2 <ip>"
+  fi
+
   [ "$CNI_IFACE_DETECT" = auto ] && CNI_IFACE_DETECT="can-reach=${FIRST_MASTER_IP}"
   return 0
+}
+
+# --masters/--workers take the FIRST N of each role, in cluster.conf order, so a
+# smaller cluster is a flag rather than a hand-edited (and later hand-restored)
+# config file. It filters NAMES/IPS/ROLES/XLABELS too, not just the per-role
+# arrays -- preflight, prep, hosts-file generation and reset all walk NAMES, and
+# a node left in there is a node this script would try to SSH into.
+#
+# Deselected nodes are simply not touched: no join, no reset, no /etc/hosts
+# entry. Their VMs can stay powered off, which is the point of asking for fewer.
+select_nodes() {
+  [ -n "$WANT_MASTERS" ] || [ -n "$WANT_WORKERS" ] || return 0
+
+  local have_m=${#MASTER_NAMES[@]} have_w=${#WORKER_NAMES[@]} sel_m sel_w i
+  sel_m="${WANT_MASTERS:-$have_m}"; sel_w="${WANT_WORKERS:-$have_w}"
+
+  case "$sel_m" in ''|*[!0-9]*) die "--masters wants a whole number, got '$sel_m'" ;; esac
+  case "$sel_w" in ''|*[!0-9]*) die "--workers wants a whole number, got '$sel_w'" ;; esac
+
+  [ "$sel_m" -ge 1 ] || die "--masters must be at least 1"
+  [ "$sel_m" -le "$have_m" ] || die "--masters $sel_m, but $CONFIG defines $have_m: ${MASTER_NAMES[*]:-none}
+       Add another master-N line to NODES to grow the pool."
+  [ "$sel_w" -le "$have_w" ] || die "--workers $sel_w, but $CONFIG defines $have_w: ${WORKER_NAMES[*]:-none}
+       Add another worker-N line to NODES to grow the pool."
+  # etcd quorum is (N/2)+1, so 2 masters tolerates FEWER failures than 1: losing
+  # either one breaks quorum and the survivor cannot elect a leader. Use 1 or 3.
+  [ "$sel_m" != 2 ] || warn "2 masters is worse than 1 -- quorum is 2 of 2, so either failure stops the API. Prefer 1 or 3."
+
+  local -A keep=()
+  for ((i=0; i<sel_m; i++)); do keep["${MASTER_NAMES[$i]}"]=1; done
+  for ((i=0; i<sel_w; i++)); do keep["${WORKER_NAMES[$i]}"]=1; done
+
+  local n=() p=() r=() x=()
+  for i in "${!NAMES[@]}"; do
+    [ -n "${keep[${NAMES[$i]}]:-}" ] || continue
+    n+=("${NAMES[$i]}"); p+=("${IPS[$i]}"); r+=("${ROLES[$i]}"); x+=("${XLABELS[$i]}")
+  done
+  NAMES=("${n[@]}"); IPS=("${p[@]}"); ROLES=("${r[@]}"); XLABELS=("${x[@]}")
+
+  MASTER_NAMES=("${MASTER_NAMES[@]:0:$sel_m}"); MASTER_IPS=("${MASTER_IPS[@]:0:$sel_m}")
+  if [ "$sel_w" -gt 0 ]; then
+    WORKER_NAMES=("${WORKER_NAMES[@]:0:$sel_w}"); WORKER_IPS=("${WORKER_IPS[@]:0:$sel_w}")
+  else
+    WORKER_NAMES=(); WORKER_IPS=()
+    warn "0 workers -- nothing will schedule until the control-plane taint is removed"
+  fi
+
+  log "selected $sel_m/$have_m master(s) and $sel_w/$have_w worker(s) from $CONFIG"
+  log "  building: ${NAMES[*]}"
 }
 
 ip_of() { local i; for i in "${!NAMES[@]}"; do [ "${NAMES[$i]}" = "$1" ] && { echo "${IPS[$i]}"; return 0; }; done; return 1; }
@@ -1160,6 +1228,10 @@ usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     -v|--verbose|--logs) VERBOSE=yes; shift ;;
+    -m|--masters)        WANT_MASTERS="${2:-}"; [ -n "$WANT_MASTERS" ] || die "$1 needs a number"; shift 2 ;;
+    -w|--workers)        WANT_WORKERS="${2:-}"; [ -n "$WANT_WORKERS" ] || die "$1 needs a number"; shift 2 ;;
+    --masters=*)         WANT_MASTERS="${1#*=}"; shift ;;
+    --workers=*)         WANT_WORKERS="${1#*=}"; shift ;;
     --)                  shift; break ;;
     *)                   break ;;
   esac
