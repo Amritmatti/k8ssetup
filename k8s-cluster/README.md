@@ -127,6 +127,39 @@ Single-node-control-plane lab? Leave `VIP=""` and list one master.
 ./deploy.sh deploy        # the whole thing, ~8-15 min
 ```
 
+### Building fewer nodes than the config lists
+
+`cluster.conf` is the *pool*; `--masters` / `--workers` pick how many of it to build.
+They take the first N of each role, so you never edit (and later un-edit) the config to
+get a smaller cluster:
+
+```bash
+./deploy.sh -m 1 -w 3 deploy      # 1 master, 3 workers
+./deploy.sh --masters=3 --workers=1 deploy
+./deploy.sh -m 1 -w 3 reset       # same four nodes, nothing else touched
+```
+
+Flags come before the command, and apply to every command — `status`, `reset` and
+`preflight` all act on exactly the selected nodes. The rest are left alone entirely: not
+prepped, not joined, not in `/etc/hosts`, and their VMs can stay powered off. Ask for
+more than the config defines and it stops and tells you which labels exist.
+
+Pair it with the VM builder, which takes the same counts:
+
+```powershell
+.\vms.ps1 -Masters 1 -Workers 3      # create only the VMs you are going to use
+```
+
+**Two masters is worse than one** — etcd quorum is `(N/2)+1`, so a 2-member cluster
+needs both alive; losing either stops the API, where a single master at least fails
+predictably. `-m 2` warns about this. Use 1 or 3.
+
+**A single master keeps the VIP.** `kubeadm` bakes `controlPlaneEndpoint` in at init, so
+a cluster pointed straight at `<master-ip>:6443` can never gain a second master without
+a full re-init. With `VIP` set, `-m 1` still initialises against the VIP — keepalived
+simply holds it permanently — and `./deploy.sh add master-2 <ip>` works later. Set
+`VIP=""` only for a cluster you are certain will stay single-master.
+
 What `deploy` does, in order:
 
 1. **preflight** — refuses to touch anything if a VM is misconfigured.
