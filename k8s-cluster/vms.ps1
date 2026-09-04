@@ -4,8 +4,9 @@
 
 .DESCRIPTION
     Clones a powered-off base VM N times, gives each clone a bridged NIC,
-    boots it, then logs in over SSH at the base IP and rewrites the node's
-    hostname and static IP address. Clones are left RUNNING.
+    boots it with a console (use -Headless for an unattended run), then logs
+    in over SSH at the base IP and rewrites the node's hostname and static IP
+    address. Clones are left RUNNING.
 
     Creates (defaults):
       k8s-master-1  192.168.1.180
@@ -33,7 +34,7 @@
     a single-master cluster.
 
 .EXAMPLE
-    .\vms.ps1 -Masters 3 -Workers 2 -BaseVM ubuntu-2404-base -BaseIp 192.168.1.190 -WhatIf
+    .\vms.ps1 -Masters 3 -Workers 2 -BaseVM 'Ubuntu 25 Base' -BaseIp 192.168.1.151 -WhatIf
     Show the plan without touching VirtualBox.
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -42,9 +43,9 @@ param(
     [int]    $Workers   = 3,
 
     # Powered-off template VM, already running SSH with your key installed.
-    [string] $BaseVM    = 'k8s-base',
+    [string] $BaseVM    = 'Ubuntu 24 Base',
     # Address the base image comes up on (DHCP reservation or its own static).
-    [string] $BaseIp    = '192.168.1.190',
+    [string] $BaseIp    = '192.168.1.150',
 
     # Reserved blocks. Each role indexes its OWN list -- this is the whole
     # point: worker numbering must not depend on how many masters were made.
@@ -57,12 +58,23 @@ param(
     [string[]] $Dns     = @('192.168.1.1', '1.1.1.1'),
 
     [string] $Bridge    = '',          # host NIC to bridge onto; auto-detected if empty
-    [int]    $Cpus      = 2,
-    [int]    $MemoryMB  = 2560,
+    # Where the clones are written. Empty means "next to the base VM" -- the
+    # roomy disk the base image was deliberately put on. VirtualBox's own
+    # default machine folder sits under the user profile on the system drive,
+    # where four full clones of a 12 GB image do not fit.
+    [string] $BaseFolder = '',
+    [int]    $Cpus      = 4,
+    [int]    $MemoryMB  = 12288,
 
     [string] $SshUser   = 'ubuntu',
     [string] $SshKey    = '',          # e.g. $HOME\.ssh\id_rsa ; empty = default/agent
     [switch] $Linked,                  # linked clone (fast, small) instead of full
+    # A headless clone that never reaches its address gives you nothing to
+    # look at: the run just waits out Wait-Ssh and reports a timeout. Booting
+    # with a console means the boot messages, a netplan error or a login
+    # prompt sitting there are visible while it happens. Headless stays
+    # available for an unattended run that nobody is watching.
+    [switch] $Headless,
     [switch] $Force,                   # skip the confirmation prompt
     [switch] $SkipUpgrade              # do not apt update/upgrade the clones
 )
@@ -88,6 +100,14 @@ function Get-VBoxManage {
 
 function Invoke-VBox {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+    # 2>&1 on a native command turns its stderr into ErrorRecords, and under
+    # $ErrorActionPreference = 'Stop' the first one is a terminating
+    # NativeCommandError -- so a chatty-but-successful VBoxManage killed the
+    # script, and a genuinely failing one died with PowerShell's opaque
+    # wrapper instead of the message below. Relax the preference just for the
+    # redirect; the assignment is function-scoped and does not leak. The exit
+    # code, not the stderr, is what decides success.
+    $ErrorActionPreference = 'Continue'
     $out = & $script:VBM @Args 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "VBoxManage $($Args -join ' ') failed:`n$($out -join "`n")"
@@ -110,6 +130,26 @@ function Get-VMState {
     return 'unknown'
 }
 
+function Get-VMFolder {
+    param([string]$Name)
+    $info = & $script:VBM showvminfo $Name --machinereadable 2>$null
+    $line = $info | Where-Object { $_ -like 'CfgFile=*' } | Select-Object -First 1
+    if (-not $line) { return $null }
+    # CfgFile is the .vbox file inside the machine's own directory. The value
+    # comes back quoted, with its backslashes doubled.
+    $cfg = ($line -replace '^CfgFile=', '').Trim('"').Replace('\', '\')
+    return (Split-Path -Parent $cfg)
+}
+
+function Get-FolderSizeBytes {
+    param([string]$Path)
+    $sum = Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
+           Measure-Object -Property Length -Sum
+    return [long]$sum.Sum
+}
+
+function Format-GB { param([double]$Bytes) return ("{0:N1} GB" -f ($Bytes / 1GB)) }
+
 function Test-Ping {
     param([string]$Ip)
     return (Test-Connection -ComputerName $Ip -Count 1 -Quiet -ErrorAction SilentlyContinue)
@@ -126,7 +166,18 @@ function Get-SshArgs {
 
 function Invoke-Ssh {
     param([string]$Ip, [string]$Command, [switch]$IgnoreExit)
+    # This script is saved CRLF, so every here-string below carries CRLF into
+    # a shell that does not treat \r as whitespace. `set -e` becomes an
+    # invalid option, so errexit never turns on; a quoted argument gains a
+    # trailing \r; a command substitution captures one, which is how the
+    # interface name came out as "enp0s3\r" and made the netplan file invalid
+    # YAML. Worst of all a heredoc's terminator reads as "EOF\r" and never
+    # matches its "EOF", so the remainder of the script is swallowed as
+    # heredoc text and silently never runs. Normalise once, here, rather than
+    # depending on how the file happens to be saved.
+    $Command = $Command -replace "`r`n", "`n"
     $sshArgs = (Get-SshArgs) + @("$SshUser@$Ip", $Command)
+    $ErrorActionPreference = 'Continue'   # see Invoke-VBox: 2>&1 + Stop = throw
     $out = & ssh @sshArgs 2>&1
     if (-not $IgnoreExit -and $LASTEXITCODE -ne 0) {
         throw "ssh $SshUser@$Ip failed:`n$($out -join "`n")"
@@ -140,7 +191,11 @@ function Invoke-Ssh {
 # text and, while it is running, indistinguishable from a hang.
 function Invoke-SshLive {
     param([string]$Ip, [string]$Command, [switch]$IgnoreExit)
+    $Command = $Command -replace "`r`n", "`n"   # see Invoke-Ssh
     $sshArgs = (Get-SshArgs) + @("$SshUser@$Ip", $Command)
+    # apt-get and dpkg say a great deal on stderr while succeeding; without
+    # this the first such line aborted the upgrade (see Invoke-VBox).
+    $ErrorActionPreference = 'Continue'
     & ssh @sshArgs 2>&1 | ForEach-Object { Write-Host "       $_" -ForegroundColor DarkGray }
     if (-not $IgnoreExit -and $LASTEXITCODE -ne 0) {
         throw "ssh $SshUser@$Ip failed (exit $LASTEXITCODE)"
@@ -149,14 +204,35 @@ function Invoke-SshLive {
 
 function Wait-Ssh {
     param([string]$Ip, [int]$TimeoutSec = 300, [string]$What = 'SSH')
+    # Every poll before the node is up prints "Connection refused" or
+    # "Connection timed out" on ssh's stderr. Merged by 2>&1 under
+    # $ErrorActionPreference = 'Stop' that is a terminating error, so the wait
+    # threw on its first attempt instead of retrying -- the loop below could
+    # never actually wait for anything. See Invoke-VBox.
+    $ErrorActionPreference = 'Continue'
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $last = '(ssh said nothing)'
     while ((Get-Date) -lt $deadline) {
         $sshArgs = (Get-SshArgs) + @('-o', 'BatchMode=yes', "$SshUser@$Ip", 'echo ready')
         $out = & ssh @sshArgs 2>&1
         if ($LASTEXITCODE -eq 0 -and ($out -join '') -match 'ready') { return $true }
+        $last = (($out | ForEach-Object { "$_" }) -join '; ').Trim()
+
+        # A refused key is not a race with a node that is still booting: sshd
+        # is already up and answering, and no amount of waiting puts a key in
+        # an image that does not have one. Sitting out the full timeout
+        # reports "timed out" for a problem that has nothing to do with time.
+        if ($last -match 'Permission denied|Too many authentication failures') {
+            throw ("$What on $Ip is up but refused the key -- $last`n" +
+                   "  Put your public key in ~$SshUser/.ssh/authorized_keys on the base image, " +
+                   "or pass -SshUser / -SshKey to match what the image does accept.")
+        }
         Start-Sleep -Seconds 5
     }
-    throw "timed out after ${TimeoutSec}s waiting for $What on $Ip"
+    # What ssh said last separates "still booting" from "wrong address" and
+    # "sshd never started"; without it the timeout reports only that something
+    # did not happen.
+    throw "timed out after ${TimeoutSec}s waiting for $What on $Ip -- last ssh error: $last"
 }
 
 # --------------------------------------------------------------- planning ---
@@ -208,6 +284,8 @@ Write-Info "per clone   : $Cpus vCPU, $MemoryMB MB, bridged NIC, promiscuous all
 
 # ----------------------------------------------------------- sanity checks ---
 Write-Step "checks"
+$whatIfSaved = $WhatIfPreference
+$WhatIfPreference = $false
 if (-not (Test-VMExists $BaseVM)) { throw "base VM '$BaseVM' does not exist in VirtualBox" }
 $baseState = Get-VMState $BaseVM
 if ($baseState -ne 'poweroff' -and $baseState -ne 'saved') {
@@ -225,14 +303,62 @@ foreach ($n in $nodes) {
 }
 Write-Ok "every target address is free"
 
+# A full clone is a byte-for-byte copy of the base disk, so what it will need
+# is knowable before anything is cloned. Running out of room halfway is the
+# worst way to learn it: VBoxManage fails on clone three or four, and the
+# clones that did land are already booted and holding addresses.
+$baseMachineDir = Get-VMFolder $BaseVM
+if (-not $BaseFolder) {
+    if (-not $baseMachineDir) { throw "cannot determine where '$BaseVM' lives; pass -BaseFolder" }
+    # --basefolder wants the folder that HOLDS machine directories, not the
+    # base machine's own -- one level up from its .vbox.
+    $BaseFolder = Split-Path -Parent $baseMachineDir
+}
+if (-not (Test-Path $BaseFolder)) { throw "-BaseFolder '$BaseFolder' does not exist" }
+$BaseFolder = (Resolve-Path $BaseFolder).ProviderPath
+
+$baseBytes = Get-FolderSizeBytes $baseMachineDir
+$drive     = Get-PSDrive -Name (Split-Path -Qualifier $BaseFolder).TrimEnd(':') -ErrorAction SilentlyContinue
+# A linked clone shares the base disk; only a full clone copies it. The extra
+# 10% is headroom for the apt upgrade each node runs on the way up.
+$needBytes = [long](($(if ($Linked) { $baseBytes * 0.1 } else { $baseBytes * 1.1 })) * $nodes.Count)
+if ($drive -and $drive.Free -lt $needBytes) {
+    throw ("not enough room in $BaseFolder -- $($nodes.Count) $(if ($Linked) { 'linked' } else { 'full' }) " +
+           "clone(s) need about $(Format-GB $needBytes) and only $(Format-GB $drive.Free) is free. " +
+           "Point -BaseFolder at a bigger disk, or use -Linked.")
+}
+Write-Ok "clones go to $BaseFolder (need ~$(Format-GB $needBytes), $(Format-GB $drive.Free) free)"
+
 if (-not $Bridge) {
-    $bridged = & $script:VBM list bridgedifs
-    $Bridge = ($bridged | Where-Object { $_ -like 'Name:*' } | Select-Object -First 1) -replace '^Name:\s*', ''
-    if (-not $Bridge) { throw "no bridged interface found; pass -Bridge '<host NIC name>'" }
-    Write-Warn "auto-selected bridge NIC: $Bridge (override with -Bridge)"
+    $names = & $script:VBM list bridgedifs |
+             Where-Object { $_ -like 'Name:*' } |
+             ForEach-Object { $_ -replace '^Name:\s*', '' }
+    if (-not $names) { throw "no bridged interface found; pass -Bridge '<host NIC name>'" }
+
+    # Taking the first entry is a coin toss on a host carrying VPN, WSL,
+    # Hyper-V and a second onboard NIC, and losing it is expensive: the clone
+    # boots onto a network the base address does not live on and the only
+    # symptom is Wait-Ssh timing out five minutes later with nothing to point
+    # at. The adapter holding the host's default route is by definition the
+    # one on the node subnet, and VirtualBox names a bridged interface after
+    # the adapter's description, so the two can be matched exactly.
+    $Bridge = $null
+    $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+             Sort-Object RouteMetric | Select-Object -First 1
+    if ($route) {
+        $desc = (Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue).InterfaceDescription
+        if ($desc) { $Bridge = $names | Where-Object { $_ -eq $desc } | Select-Object -First 1 }
+    }
+    if ($Bridge) {
+        Write-Ok "bridge NIC: $Bridge (carries the host default route)"
+    } else {
+        $Bridge = @($names)[0]
+        Write-Warn "auto-selected bridge NIC: $Bridge (override with -Bridge)"
+    }
 } else {
     Write-Ok "bridge NIC: $Bridge"
 }
+$WhatIfPreference = $whatIfSaved
 
 if (-not $Force -and -not $WhatIfPreference) {
     $answer = Read-Host "  Create $($nodes.Count) VM(s)? Type 'yes' to continue"
@@ -251,7 +377,7 @@ foreach ($n in $nodes) {
         throw "$BaseIp is still in use -- the previous clone did not move off the base address"
     }
 
-    $cloneArgs = @('clonevm', $BaseVM, '--name', $n.Name, '--register')
+    $cloneArgs = @('clonevm', $BaseVM, '--name', $n.Name, '--register', '--basefolder', $BaseFolder)
     if ($Linked) { $cloneArgs += @('--options', 'link', '--snapshot', 'base') }
     else         { $cloneArgs += @('--mode', 'machine') }
     Write-Info "cloning"
@@ -261,10 +387,15 @@ foreach ($n in $nodes) {
     Invoke-VBox modifyvm $n.Name --cpus $Cpus --memory $MemoryMB | Out-Null
     Invoke-VBox modifyvm $n.Name --nic1 bridged --bridgeadapter1 $Bridge `
                 --nicpromisc1 allow-all --macaddress1 auto | Out-Null
-    Invoke-VBox modifyvm $n.Name --groups '/k8s-lab' | Out-Null
+    # No VirtualBox group. A group is a folder on disk as well as a label --
+    # assigning one relocates the machine under E:\VMs\k8s-lab\ -- and
+    # removing the group in the GUI takes every machine inside it with it, so
+    # one click deletes the whole cluster. Ungrouped nodes are found by their
+    # k8s- name prefix and have to be deleted one at a time, on purpose.
 
-    Write-Info "booting (headless)"
-    Invoke-VBox startvm $n.Name --type headless | Out-Null
+    $bootType = $(if ($Headless) { 'headless' } else { 'gui' })
+    Write-Info "booting ($bootType)"
+    Invoke-VBox startvm $n.Name --type $bootType | Out-Null
 
     Write-Info "waiting for SSH on the base address $BaseIp"
     Wait-Ssh -Ip $BaseIp -TimeoutSec 300 -What "$($n.Name) at the base address" | Out-Null
@@ -300,7 +431,15 @@ sudo netplan generate
 sudo sh -c 'nohup netplan apply >/dev/null 2>&1 &'
 "@
     Write-Info "setting hostname '$($n.Node)' and address $($n.Ip)"
-    Invoke-Ssh -Ip $BaseIp -Command $remote -IgnoreExit | Out-Null
+    $said = Invoke-Ssh -Ip $BaseIp -Command $remote -IgnoreExit
+    $said = (($said | ForEach-Object { "$_" }) -join "`n").Trim()
+    # The session dies the moment the address changes, so the exit code says
+    # nothing useful. What the node managed to say before that does -- a
+    # rejected netplan file or a refused hostname shows up here, and used to
+    # disappear into Out-Null, leaving a 240s timeout as the only symptom.
+    if ($said -match 'Invalid YAML|Command failed|error:|is not a valid|Failed to') {
+        throw "$($n.Node) rejected the network configuration:`n$said"
+    }
 
     Write-Info "waiting for $($n.Node) on its new address"
     Wait-Ssh -Ip $n.Ip -TimeoutSec 240 -What "$($n.Node) on its new address" | Out-Null
